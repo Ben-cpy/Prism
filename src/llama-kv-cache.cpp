@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 //
@@ -30,9 +31,14 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                 uint32_t   h2o_local,
+                 uint32_t   h2o_heavy) :
     model(model), hparams(model.hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    h2o_local_window(h2o_local),
+    h2o_heavy_budget(h2o_heavy),
+    h2o_memory_size(h2o_local + h2o_heavy) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -192,6 +198,57 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (swa_type == LLAMA_SWA_TYPE_H2O && h2o_memory_size > 0) {
+        LLAMA_LOG_INFO("%s: allocating H2O tensors (L=%d, H=%d, M=%d)\n",
+                __func__, h2o_local_window, h2o_heavy_budget, h2o_memory_size);
+
+        ggml_init_params h2o_params = {
+            /*.mem_size   =*/ size_t((2u * layers.size() + 1u) * ggml_tensor_overhead()),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context_ptr h2o_ctx(ggml_init(h2o_params));
+        if (!h2o_ctx) {
+            throw std::runtime_error("failed to create ggml context for H2O buffers");
+        }
+
+        ggml_context * ctx_h2o = h2o_ctx.get();
+
+        h2o_scores.reserve(layers.size());
+        h2o_memory_indices.reserve(layers.size());
+
+        for (const auto & layer : layers) {
+            const uint32_t il = layer.il;
+            const uint32_t n_head = hparams.n_head(il);
+
+            ggml_tensor * scores = ggml_new_tensor_2d(ctx_h2o, GGML_TYPE_BF16, kv_size, n_head);
+            ggml_format_name(scores, "h2o_scores_l%d", il);
+            h2o_scores.push_back(scores);
+
+            ggml_tensor * mem_idx = ggml_new_tensor_2d(ctx_h2o, GGML_TYPE_I32, h2o_memory_size, n_head);
+            ggml_format_name(mem_idx, "h2o_mem_idx_l%d", il);
+            h2o_memory_indices.push_back(mem_idx);
+        }
+
+        ggml_backend_buffer_t buf_h2o = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx_h2o, ggml_backend_cpu_buffer_type());
+        if (!buf_h2o) {
+            throw std::runtime_error("failed to allocate H2O buffers");
+        }
+
+        ggml_backend_buffer_clear(buf_h2o, 0);
+
+        LLAMA_LOG_INFO("%s: H2O buffer size = %8.2f MiB\n",
+                __func__, ggml_backend_buffer_get_size(buf_h2o)/1024.0/1024.0);
+
+        ctxs_bufs.emplace_back(std::move(h2o_ctx), buf_h2o);
+
+        h2o_state.current_chunk_idx = 0;
+        h2o_state.total_tokens_processed = 0;
+        h2o_state.chunk_boundaries.push_back(0);
     }
 
     {
@@ -987,6 +1044,186 @@ bool llama_kv_cache::get_has_shift() const {
     }
 
     return result;
+}
+
+const ggml_tensor * llama_kv_cache::h2o_get_scores_tensor(int32_t il) const {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+    GGML_ASSERT(map_layer_ids.find(il) != map_layer_ids.end());
+
+    const int32_t il_cache = map_layer_ids.at(il);
+    return h2o_scores[il_cache];
+}
+
+const ggml_tensor * llama_kv_cache::h2o_get_memory_indices_tensor(int32_t il) const {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+    GGML_ASSERT(map_layer_ids.find(il) != map_layer_ids.end());
+
+    const int32_t il_cache = map_layer_ids.at(il);
+    return h2o_memory_indices[il_cache];
+}
+
+void llama_kv_cache::h2o_init_chunk_scores(
+        int32_t il, uint32_t chunk_start, uint32_t chunk_len,
+        const float * attn_weights_colsum) {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+    GGML_ASSERT(map_layer_ids.find(il) != map_layer_ids.end());
+    GGML_ASSERT(attn_weights_colsum != nullptr);
+
+    const int32_t il_cache = map_layer_ids[il];
+    ggml_tensor * scores = h2o_scores[il_cache];
+    GGML_ASSERT(chunk_start + chunk_len <= static_cast<uint32_t>(scores->ne[0]));
+    const uint32_t n_head = hparams.n_head(il);
+
+    ggml_bf16_t * score_data = static_cast<ggml_bf16_t *>(scores->data);
+
+    for (uint32_t ih = 0; ih < n_head; ++ih) {
+        for (uint32_t pos = 0; pos < chunk_len; ++pos) {
+            const uint32_t global_pos = chunk_start + pos;
+            const size_t score_idx = ih * scores->ne[0] + global_pos;
+            score_data[score_idx] = ggml_fp32_to_bf16(attn_weights_colsum[ih * chunk_len + pos]);
+        }
+    }
+}
+
+void llama_kv_cache::h2o_accumulate_memory_scores(
+        int32_t il, const float * inter_weights_colsum) {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+    GGML_ASSERT(h2o_memory_initialized);
+    GGML_ASSERT(map_layer_ids.find(il) != map_layer_ids.end());
+    GGML_ASSERT(inter_weights_colsum != nullptr);
+
+    const int32_t il_cache = map_layer_ids[il];
+    ggml_tensor * scores = h2o_scores[il_cache];
+    ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
+
+    const uint32_t n_head = hparams.n_head(il);
+    const uint32_t M = h2o_memory_size;
+
+    ggml_bf16_t * score_data = static_cast<ggml_bf16_t *>(scores->data);
+    const int32_t * mem_idx_data = static_cast<const int32_t *>(mem_idx->data);
+
+    for (uint32_t ih = 0; ih < n_head; ++ih) {
+        for (uint32_t m = 0; m < M; ++m) {
+            const int32_t global_pos = mem_idx_data[ih * M + m];
+            if (global_pos >= 0 && global_pos < static_cast<int32_t>(scores->ne[0])) {
+                const size_t score_idx = ih * scores->ne[0] + static_cast<size_t>(global_pos);
+                const float current = ggml_bf16_to_fp32(score_data[score_idx]);
+                const float delta = inter_weights_colsum[ih * M + m];
+                score_data[score_idx] = ggml_fp32_to_bf16(current + delta);
+            }
+        }
+    }
+}
+
+void llama_kv_cache::h2o_build_memory_set(int32_t il, uint32_t chunk_end) {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+    GGML_ASSERT(map_layer_ids.find(il) != map_layer_ids.end());
+    GGML_ASSERT(!h2o_state.chunk_boundaries.empty());
+
+    const int32_t il_cache = map_layer_ids[il];
+    ggml_tensor * scores = h2o_scores[il_cache];
+    ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
+
+    const uint32_t n_head = hparams.n_head(il);
+    const uint32_t L = h2o_local_window;
+    const uint32_t H = h2o_heavy_budget;
+    const uint32_t M = h2o_memory_size;
+    const uint32_t chunk_start = h2o_state.chunk_boundaries.back();
+    GGML_ASSERT(chunk_end <= static_cast<uint32_t>(scores->ne[0]));
+
+    const ggml_bf16_t * score_data = static_cast<const ggml_bf16_t *>(scores->data);
+    int32_t * mem_idx_data = static_cast<int32_t *>(mem_idx->data);
+
+    for (uint32_t ih = 0; ih < n_head; ++ih) {
+        std::vector<int32_t> local;
+        const uint32_t local_start = (chunk_end > L) ? (chunk_end - L) : 0;
+        for (uint32_t pos = local_start; pos < chunk_end; ++pos) {
+            local.push_back(static_cast<int32_t>(pos));
+        }
+
+        std::set<int32_t> local_set(local.begin(), local.end());
+        std::vector<std::pair<int32_t, float>> candidates;
+        candidates.reserve(M + (chunk_end - chunk_start));
+
+        if (h2o_memory_initialized) {
+            for (uint32_t m = 0; m < M; ++m) {
+                const int32_t pos = mem_idx_data[ih * M + m];
+                if (pos >= 0 && local_set.find(pos) == local_set.end()) {
+                    const size_t score_idx = ih * scores->ne[0] + static_cast<size_t>(pos);
+                    candidates.push_back({pos, ggml_bf16_to_fp32(score_data[score_idx])});
+                }
+            }
+        }
+
+        for (uint32_t pos = chunk_start; pos < chunk_end; ++pos) {
+            if (local_set.find(static_cast<int32_t>(pos)) == local_set.end()) {
+                const size_t score_idx = ih * scores->ne[0] + pos;
+                candidates.push_back({static_cast<int32_t>(pos), ggml_bf16_to_fp32(score_data[score_idx])});
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end(),
+                [](const auto & a, const auto & b) { return a.second > b.second; });
+
+        std::vector<int32_t> heavy;
+        const size_t heavy_size = std::min(static_cast<size_t>(H), candidates.size());
+        heavy.reserve(heavy_size);
+        for (size_t i = 0; i < heavy_size; ++i) {
+            heavy.push_back(candidates[i].first);
+        }
+
+        std::vector<int32_t> memory(local.begin(), local.end());
+        memory.insert(memory.end(), heavy.begin(), heavy.end());
+        std::sort(memory.begin(), memory.end());
+
+        for (uint32_t m = 0; m < M; ++m) {
+            mem_idx_data[ih * M + m] = (m < memory.size()) ? memory[m] : -1;
+        }
+    }
+
+    h2o_memory_initialized = true;
+}
+
+ggml_tensor * llama_kv_cache::h2o_gather_k_memory(ggml_context * ctx, int32_t il) const {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+    GGML_ASSERT(h2o_memory_initialized);
+
+    const int32_t il_cache = map_layer_ids.at(il);
+    const kv_layer & layer = layers[il_cache];
+    ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
+
+    ggml_tensor * k_mem = ggml_get_rows(ctx, layer.k, mem_idx);
+    ggml_set_name(k_mem, "h2o_k_mem");
+
+    return k_mem;
+}
+
+ggml_tensor * llama_kv_cache::h2o_gather_v_memory(ggml_context * ctx, int32_t il) const {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+    GGML_ASSERT(h2o_memory_initialized);
+
+    const int32_t il_cache = map_layer_ids.at(il);
+    const kv_layer & layer = layers[il_cache];
+    ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
+
+    ggml_tensor * v_mem = ggml_get_rows(ctx, layer.v, mem_idx);
+    ggml_set_name(v_mem, "h2o_v_mem");
+
+    return v_mem;
+}
+
+void llama_kv_cache::h2o_next_chunk(uint32_t chunk_len) {
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_H2O);
+
+    h2o_state.total_tokens_processed += chunk_len;
+    h2o_state.current_chunk_idx++;
+    h2o_state.chunk_boundaries.push_back(h2o_state.total_tokens_processed);
+
+    if (debug >= 1) {
+        LLAMA_LOG_DEBUG("%s: chunk %d complete, total tokens %d\n",
+                __func__, h2o_state.current_chunk_idx - 1,
+                h2o_state.total_tokens_processed);
+    }
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
