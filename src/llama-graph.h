@@ -775,6 +775,39 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // H2O intra-chunk attention with weight extraction (uses standard path, not flash)
+    ggml_tensor * build_attn_mha_h2o(
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * kq_b,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor ** attn_weights_out) const;
+
+    // H2O attention with KV cache storage and weight extraction
+    ggml_tensor * build_attn_h2o(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor ** attn_weights_out) const;
+
+    // Compute column sum of attention weights for H2O score tracking
+    // Input: attn_weights [n_kv, n_tokens, n_head, n_stream]
+    // Output: colsum [n_kv, n_head, n_stream] (sum over n_tokens dimension)
+    ggml_tensor * build_attn_colsum(ggml_tensor * attn_weights, int il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(

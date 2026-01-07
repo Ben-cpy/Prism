@@ -1610,6 +1610,144 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_attn_mha_h2o(
+         ggml_tensor * q,
+         ggml_tensor * k,
+         ggml_tensor * v,
+         ggml_tensor * kq_b,
+         ggml_tensor * kq_mask,
+         ggml_tensor * sinks,
+         ggml_tensor * v_mla,
+               float   kq_scale,
+                 int   il,
+         ggml_tensor ** attn_weights_out) const {
+    const bool v_trans = v->nb[1] > v->nb[2];
+    const auto n_stream = k->ne[3];
+
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                     q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+    cb(kq, "kq_h2o", il);
+
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+
+    if (arch == LLM_ARCH_GROK) {
+        kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
+        cb(kq, "kq_tanh_h2o", il);
+        kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+        cb(kq, "kq_scaled_h2o", il);
+    }
+
+    if (hparams.attn_soft_cap) {
+        kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
+        cb(kq, "kq_scaled_1_h2o", il);
+        kq = ggml_tanh(ctx0, kq);
+        cb(kq, "kq_tanh_h2o", il);
+        kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+        cb(kq, "kq_scaled_2_h2o", il);
+    }
+
+    if (kq_b) {
+        kq = ggml_add(ctx0, kq, kq_b);
+        cb(kq, "kq_plus_kq_b_h2o", il);
+    }
+
+    kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+    ggml_soft_max_add_sinks(kq, sinks);
+    cb(kq, "kq_soft_max_h2o", il);
+
+    if (attn_weights_out != nullptr) {
+        *attn_weights_out = kq;
+    }
+
+    if (!v_trans) {
+        v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+        cb(v, "v_cont_h2o", il);
+    }
+
+    ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+    cb(kqv, "kqv_h2o", il);
+
+    if (v_mla) {
+        kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+        cb(kqv, "kqv_mla_h2o", il);
+    }
+
+    ggml_tensor * cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+    cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    if (!cparams.offload_kqv) {
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+    }
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_h2o(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il,
+        ggml_tensor ** attn_weights_out) const {
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    const auto & kq_mask = inp->get_kq_mask();
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    ggml_tensor * cur = build_attn_mha_h2o(q, k, v, kq_b, kq_mask, sinks, v_mla,
+                                           kq_scale, il, attn_weights_out);
+    cb(cur, "kqv_out_h2o", il);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_colsum(ggml_tensor * attn_weights, int il) const {
+    ggml_tensor * permuted = ggml_permute(ctx0, attn_weights, 1, 0, 2, 3);
+    ggml_tensor * colsum = ggml_sum_rows(ctx0, permuted);
+    colsum = ggml_reshape_3d(ctx0, colsum, attn_weights->ne[0], attn_weights->ne[2], attn_weights->ne[3]);
+
+    cb(colsum, "h2o_attn_colsum", il);
+    ggml_build_forward_expand(gf, colsum);
+
+    return colsum;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
