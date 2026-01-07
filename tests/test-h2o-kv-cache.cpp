@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "llama-cpp.h"
 #include "llama-kv-cache.h"
+#include "llama-model.h"
 #include "llama.h"
 #include "get-model.h"
 
