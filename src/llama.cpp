@@ -1101,4 +1101,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-
