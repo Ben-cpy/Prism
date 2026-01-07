@@ -1,6 +1,6 @@
 # AGNET
 + this is my whole plan, i would implement this gradualy @Prism/tasks/whole_plan.md
-+ this is a jetson device with CUDA
++ this is a jetson device with CUDA, with 12 core, when you build, use the full core
 + models are in the folder /models (this is the root path, not relative path)
 ➜  /models ls, for fast dev use the 1.7B model
 Qwen3-8B-Q4_K_M.gguf  Qwen3-8B-Q5_K_M.gguf  Qwen3-8B-Q8_0.gguf         Qwen_Qwen3-4B-Q8_0.gguf
