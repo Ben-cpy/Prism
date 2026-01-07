@@ -106,7 +106,9 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                     uint32_t   h2o_local = 0,
+                     uint32_t   h2o_heavy = 0);
 
     ~llama_kv_cache() = default;
 
@@ -151,6 +153,33 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+
+    //
+    // H2O-specific API (valid when swa_type == LLAMA_SWA_TYPE_H2O)
+    //
+
+    void h2o_init_chunk_scores(
+            int32_t il, uint32_t chunk_start, uint32_t chunk_len,
+            const float * attn_weights_colsum);
+
+    void h2o_accumulate_memory_scores(
+            int32_t il, const float * inter_weights_colsum);
+
+    void h2o_build_memory_set(int32_t il, uint32_t chunk_end);
+
+    ggml_tensor * h2o_gather_k_memory(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * h2o_gather_v_memory(ggml_context * ctx, int32_t il) const;
+
+    void h2o_next_chunk(uint32_t chunk_len);
+    uint32_t h2o_get_chunk_idx() const { return h2o_state.current_chunk_idx; }
+    uint32_t h2o_get_total_tokens() const { return h2o_state.total_tokens_processed; }
+    bool h2o_is_memory_initialized() const { return h2o_memory_initialized; }
+    uint32_t h2o_get_local_window() const { return h2o_local_window; }
+    uint32_t h2o_get_heavy_budget() const { return h2o_heavy_budget; }
+    uint32_t h2o_get_memory_size() const { return h2o_memory_size; }
+
+    const ggml_tensor * h2o_get_scores_tensor(int32_t il) const;
+    const ggml_tensor * h2o_get_memory_indices_tensor(int32_t il) const;
 
     //
     // graph_build API
@@ -231,6 +260,23 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // ========== H2O-specific state (LLAMA_SWA_TYPE_H2O only) ==========
+
+    const uint32_t h2o_local_window = 0;
+    const uint32_t h2o_heavy_budget = 0;
+    const uint32_t h2o_memory_size  = 0;
+
+    std::vector<ggml_tensor *> h2o_scores;
+    std::vector<ggml_tensor *> h2o_memory_indices;
+
+    struct h2o_chunk_state {
+        uint32_t current_chunk_idx = 0;
+        uint32_t total_tokens_processed = 0;
+        std::vector<uint32_t> chunk_boundaries;
+    } h2o_state;
+
+    bool h2o_memory_initialized = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

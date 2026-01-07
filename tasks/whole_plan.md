@@ -19,7 +19,7 @@ $$\text{Total FLOPs} \propto \sum_{t=1}^{N} t = \frac{N(N+1)}{2} = O(N^2)$$
 ### 1.2 Proposed Method: Block-Sparse Causal Attention Approximation
 
 We replace full causal attention with a **block-sparse approximation** that maintains:
-- **Intra-chunk**: Full causal attention within each chunk
+- **Intra-chunk**: Full causal attention within each chunk, In this architecture, given that our prefill phase no longer relies on sequential dependencies, attention calculation within each intra-chunk iteration is executed in parallel. For instance, a 4096-token prompt is segmented into four 1024-token chunks, and these four chunks initially undergo internal parallel prefill computation (thereby augmenting throughput).
 - **Inter-chunk**: Attention only to a bounded subset $\mathcal{M}_c$ of historical KV pairs
 
 #### 1.2.1 Notation
