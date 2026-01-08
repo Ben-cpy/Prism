@@ -326,6 +326,7 @@ public:
 
     std::map<int, ggml_tensor *> intra_o; // [il] -> cached per-head output
     std::map<int, ggml_tensor *> intra_l; // [il] -> cached sum exp
+    std::map<int, ggml_tensor *> intra_m; // [il] -> cached max logits
 
 private:
     const h2o_prefill_cache * cache;
@@ -601,12 +602,13 @@ public:
     std::map<int, ggml_tensor *> t_h2o_inter_colsum;
     std::map<int, ggml_tensor *> t_h2o_intra_o;
     std::map<int, ggml_tensor *> t_h2o_intra_l;
+    std::map<int, ggml_tensor *> t_h2o_intra_m;
 
     // Online softmax state for chunked attention fusion
     struct h2o_online_softmax_state {
-        ggml_tensor * m = nullptr; // [n_tokens, n_head] running max/logsumexp proxy (optional)
-        ggml_tensor * l = nullptr; // [n_tokens, n_head] running sum exp(logit - m)
-        ggml_tensor * o = nullptr; // [n_embd_head_v, n_tokens, n_head] running weighted sum
+        ggml_tensor * m = nullptr; // [1, n_tokens, n_head, n_stream] row-wise max of logits
+        ggml_tensor * l = nullptr; // [1, n_tokens, n_head, n_stream] sum exp(logit - m)
+        ggml_tensor * o = nullptr; // [n_embd_head_v, n_tokens, n_head, n_stream] normalized weighted sum
         bool initialized = false;
     };
 

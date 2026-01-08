@@ -212,14 +212,19 @@ int main(int argc, char ** argv) {
 
     cache.intra_o.assign(hparams.n_layer, {});
     cache.intra_l.assign(hparams.n_layer, {});
+    cache.intra_m.assign(hparams.n_layer, {});
     cache.base_pos = ubatch_full.pos ? ubatch_full.pos[0] : 0;
 
     for (const auto & [layer_id, t_intra_o] : res1.t_h2o_intra_o) {
         const auto it_l = res1.t_h2o_intra_l.find(layer_id);
         require(it_l != res1.t_h2o_intra_l.end(), "missing intra l for layer");
+        const auto it_m = res1.t_h2o_intra_m.find(layer_id);
+        require(it_m != res1.t_h2o_intra_m.end(), "missing intra m for layer");
 
         const auto * t_intra_l = it_l->second;
+        const auto * t_intra_m = it_m->second;
         require(t_intra_l != nullptr, "missing intra l tensor");
+        require(t_intra_m != nullptr, "missing intra m tensor");
         require(t_intra_o != nullptr, "missing intra o tensor");
 
         cache.n_tokens = static_cast<uint32_t>(t_intra_o->ne[1]);
@@ -232,6 +237,9 @@ int main(int argc, char ** argv) {
 
         cache.intra_l[layer_id].resize(ggml_nelements(t_intra_l));
         ggml_backend_tensor_get(t_intra_l, cache.intra_l[layer_id].data(), 0, cache.intra_l[layer_id].size() * sizeof(float));
+
+        cache.intra_m[layer_id].resize(ggml_nelements(t_intra_m));
+        ggml_backend_tensor_get(t_intra_m, cache.intra_m[layer_id].data(), 0, cache.intra_m[layer_id].size() * sizeof(float));
     }
 
     cache.initialized = true;

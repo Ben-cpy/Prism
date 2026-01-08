@@ -34,8 +34,9 @@ struct llama_memory_breakdown_data {
 
 struct h2o_prefill_cache {
     // per layer:
-    std::vector<std::vector<float>> intra_o; // [il] -> [n_embd_head_v * n_tokens * n_head * n_stream]
-    std::vector<std::vector<float>> intra_l; // [il] -> [n_tokens * n_head * n_stream]
+    std::vector<std::vector<float>> intra_o; // [il] -> [n_embd_head_v * n_tokens * n_head * n_stream] normalized output
+    std::vector<std::vector<float>> intra_l; // [il] -> [n_tokens * n_head * n_stream] sum exp(logit - m)
+    std::vector<std::vector<float>> intra_m; // [il] -> [n_tokens * n_head * n_stream] row-wise max logits
     uint32_t n_tokens = 0;
     uint32_t n_head = 0;
     uint32_t n_embd_head_v = 0;

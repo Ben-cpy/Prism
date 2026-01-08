@@ -1604,6 +1604,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (h2o_two_phase && phase == 1 && !h2o_cache_ready && !res->t_h2o_intra_o.empty()) {
                 h2o_cache.intra_o.assign(hparams.n_layer, {});
                 h2o_cache.intra_l.assign(hparams.n_layer, {});
+                h2o_cache.intra_m.assign(hparams.n_layer, {});
                 h2o_cache.n_tokens = ubatch.n_tokens;
                 h2o_cache.base_pos = ubatch.pos ? ubatch.pos[0] : 0;
                 h2o_cache.n_head = 0;
@@ -1620,8 +1621,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (it_l == res->t_h2o_intra_l.end() || it_l->second == nullptr) {
                         continue;
                     }
+                    const auto it_m = res->t_h2o_intra_m.find(il);
+                    if (it_m == res->t_h2o_intra_m.end() || it_m->second == nullptr) {
+                        continue;
+                    }
 
                     const auto * t_intra_l = it_l->second;
+                    const auto * t_intra_m = it_m->second;
 
                     const uint32_t n_head = static_cast<uint32_t>(t_intra_o->ne[2]);
                     const uint32_t n_embd_head_v = static_cast<uint32_t>(t_intra_o->ne[0]);
@@ -1645,6 +1651,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                     h2o_cache.intra_l[il].resize(ggml_nelements(t_intra_l));
                     ggml_backend_tensor_get(t_intra_l, h2o_cache.intra_l[il].data(), 0, h2o_cache.intra_l[il].size() * sizeof(float));
+
+                    h2o_cache.intra_m[il].resize(ggml_nelements(t_intra_m));
+                    ggml_backend_tensor_get(t_intra_m, h2o_cache.intra_m[il].data(), 0, h2o_cache.intra_m[il].size() * sizeof(float));
                     filled = true;
                 }
 

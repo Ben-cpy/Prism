@@ -476,6 +476,14 @@ void llm_graph_input_h2o_intra::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(data.size() == ggml_nelements(tensor));
         ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
     }
+
+    for (const auto & [il, tensor] : intra_m) {
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(il >= 0 && static_cast<size_t>(il) < cache->intra_m.size());
+        const auto & data = cache->intra_m[il];
+        GGML_ASSERT(data.size() == ggml_nelements(tensor));
+        ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
+    }
 }
 
 bool llm_graph_input_h2o_intra::can_reuse(const llm_graph_params & params) {
@@ -504,6 +512,15 @@ bool llm_graph_input_h2o_intra::can_reuse(const llm_graph_params & params) {
             return false;
         }
         if (cache_params->intra_l[il].size() != ggml_nelements(tensor)) {
+            return false;
+        }
+    }
+
+    for (const auto & [il, tensor] : intra_m) {
+        if (il < 0 || static_cast<size_t>(il) >= cache_params->intra_m.size()) {
+            return false;
+        }
+        if (cache_params->intra_m[il].size() != ggml_nelements(tensor)) {
             return false;
         }
     }
@@ -689,6 +706,7 @@ void llm_graph_result::reset() {
     t_h2o_inter_colsum.clear();
     t_h2o_intra_o.clear();
     t_h2o_intra_l.clear();
+    t_h2o_intra_m.clear();
     h2o_phase = {};
 
     params = {};
@@ -760,6 +778,11 @@ void llm_graph_result::set_outputs() {
         }
     }
     for (auto & [il, t] : t_h2o_intra_l) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto & [il, t] : t_h2o_intra_m) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -1832,6 +1855,10 @@ ggml_tensor * llm_graph_context::build_attn_mha_h2o(
     return cur;
 }
 
+namespace {
+    ggml_tensor * h2o_pairwise_max(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b);
+}
+
 ggml_tensor * llm_graph_context::build_attn_h2o(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -1885,6 +1912,7 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
 
         ggml_tensor * intra_o_full = nullptr;
         ggml_tensor * intra_l_full = nullptr;
+        ggml_tensor * intra_m_full = nullptr;
 
         auto it_o = inp_h2o->intra_o.find(il);
         if (it_o == inp_h2o->intra_o.end()) {
@@ -1912,6 +1940,17 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
             intra_l_full = it_l->second;
         }
 
+        auto it_m = inp_h2o->intra_m.find(il);
+        if (it_m == inp_h2o->intra_m.end()) {
+            const int64_t n_head = hparams.n_head(il);
+            intra_m_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32,
+                    h2o_prefill->n_tokens, n_head, n_stream);
+            ggml_set_input(intra_m_full);
+            inp_h2o->intra_m.emplace(il, intra_m_full);
+        } else {
+            intra_m_full = it_m->second;
+        }
+
         ggml_tensor * intra_o = ggml_view_4d(ctx0, intra_o_full,
                 intra_o_full->ne[0], ubatch.n_tokens, intra_o_full->ne[2], intra_o_full->ne[3],
                 intra_o_full->nb[1], intra_o_full->nb[2], intra_o_full->nb[3],
@@ -1921,6 +1960,11 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
                 ubatch.n_tokens, intra_l_full->ne[1], intra_l_full->ne[2],
                 intra_l_full->nb[1], intra_l_full->nb[2],
                 token_offset * intra_l_full->nb[0]);
+
+        ggml_tensor * intra_m = ggml_view_3d(ctx0, intra_m_full,
+                ubatch.n_tokens, intra_m_full->ne[1], intra_m_full->ne[2],
+                intra_m_full->nb[1], intra_m_full->nb[2],
+                token_offset * intra_m_full->nb[0]);
 
         const auto * mctx_kv = inp->mctx;
         const bool use_inter = token_offset > 0 && mctx_kv->h2o_is_memory_initialized();
@@ -1948,28 +1992,48 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
             if (state.o && intra_o_cast->type != state.o->type) {
                 intra_o_cast = ggml_cast(ctx0, intra_o_cast, state.o->type);
             }
-            ggml_tensor * intra_l_cast = intra_l;
-            if (state.l && intra_l_cast->type != state.l->type) {
-                intra_l_cast = ggml_cast(ctx0, intra_l_cast, state.l->type);
+
+            ggml_tensor * intra_l4 = ggml_reshape_4d(ctx0, intra_l, 1, intra_l->ne[0], intra_l->ne[1], intra_l->ne[2]);
+            if (state.l && intra_l4->type != state.l->type) {
+                intra_l4 = ggml_cast(ctx0, intra_l4, state.l->type);
             }
 
-            ggml_tensor * o_total = ggml_add(ctx0, state.o, intra_o_cast);
-            ggml_tensor * l_total = ggml_add(ctx0, state.l, intra_l_cast);
-
-            ggml_tensor * l_broadcast = ggml_repeat(ctx0, l_total, o_total);
-            if (l_broadcast->type != o_total->type) {
-                l_broadcast = ggml_cast(ctx0, l_broadcast, o_total->type);
+            ggml_tensor * intra_m4 = ggml_reshape_4d(ctx0, intra_m, 1, intra_m->ne[0], intra_m->ne[1], intra_m->ne[2]);
+            if (state.m && intra_m4->type != state.m->type) {
+                intra_m4 = ggml_cast(ctx0, intra_m4, state.m->type);
             }
-            fused = ggml_div(ctx0, o_total, l_broadcast);
+
+            ggml_tensor * m_total = h2o_pairwise_max(ctx0, state.m, intra_m4);
+            ggml_tensor * scale_inter = ggml_exp(ctx0, ggml_sub(ctx0, state.m, m_total));
+            ggml_tensor * scale_intra = ggml_exp(ctx0, ggml_sub(ctx0, intra_m4, m_total));
+
+            ggml_tensor * l_inter = ggml_mul(ctx0, state.l, scale_inter);
+            ggml_tensor * l_intra = ggml_mul(ctx0, intra_l4, scale_intra);
+            ggml_tensor * l_total = ggml_add(ctx0, l_inter, l_intra);
+
+            ggml_tensor * l_inter_bc = ggml_repeat(ctx0, l_inter, state.o);
+            ggml_tensor * l_intra_bc = ggml_repeat(ctx0, l_intra, intra_o_cast);
+            if (l_inter_bc->type != state.o->type) {
+                l_inter_bc = ggml_cast(ctx0, l_inter_bc, state.o->type);
+            }
+            if (l_intra_bc->type != intra_o_cast->type) {
+                l_intra_bc = ggml_cast(ctx0, l_intra_bc, intra_o_cast->type);
+            }
+
+            ggml_tensor * o_inter = ggml_mul(ctx0, state.o, l_inter_bc);
+            ggml_tensor * o_intra = ggml_mul(ctx0, intra_o_cast, l_intra_bc);
+            ggml_tensor * o_sum = ggml_add(ctx0, o_inter, o_intra);
+
+            ggml_tensor * l_total_bc = ggml_repeat(ctx0, l_total, o_sum);
+            if (l_total_bc->type != o_sum->type) {
+                l_total_bc = ggml_cast(ctx0, l_total_bc, o_sum->type);
+            }
+            fused = ggml_div(ctx0, o_sum, l_total_bc);
         } else {
             if (res != nullptr) {
                 res->t_h2o_inter_colsum.erase(il);
             }
-            ggml_tensor * l_broadcast = ggml_repeat(ctx0, intra_l, intra_o);
-            if (l_broadcast->type != intra_o->type) {
-                l_broadcast = ggml_cast(ctx0, l_broadcast, intra_o->type);
-            }
-            fused = ggml_div(ctx0, intra_o, l_broadcast);
+            fused = intra_o;
         }
 
         if (v_mla) {
@@ -1999,18 +2063,24 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
 
             ggml_tensor * o_out = state.o;
             ggml_tensor * l_out = state.l;
+            ggml_tensor * m_out = state.m;
             if (o_out->type != GGML_TYPE_F32) {
                 o_out = ggml_cast(ctx0, o_out, GGML_TYPE_F32);
             }
             if (l_out->type != GGML_TYPE_F32) {
                 l_out = ggml_cast(ctx0, l_out, GGML_TYPE_F32);
             }
+            if (m_out->type != GGML_TYPE_F32) {
+                m_out = ggml_cast(ctx0, m_out, GGML_TYPE_F32);
+            }
 
             res->t_h2o_intra_o[il] = o_out;
             res->t_h2o_intra_l[il] = l_out;
+            res->t_h2o_intra_m[il] = m_out;
 
             ggml_build_forward_expand(gf, o_out);
             ggml_build_forward_expand(gf, l_out);
+            ggml_build_forward_expand(gf, m_out);
         }
 
         if (v_mla) {
@@ -2045,16 +2115,37 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
 }
 
 namespace {
-    ggml_tensor * h2o_logits_sum_exp(ggml_context * ctx, ggml_tensor * logits) {
+    struct h2o_sum_exp_result {
+        ggml_tensor * m = nullptr; // row-wise max
+        ggml_tensor * l = nullptr; // sum exp(logit - m)
+    };
+
+    ggml_tensor * h2o_pairwise_max(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+        ggml_tensor * diff = ggml_sub(ctx, a, b);
+        ggml_tensor * abs_diff = ggml_abs(ctx, diff);
+        ggml_tensor * sum = ggml_add(ctx, a, b);
+        ggml_tensor * sum_abs = ggml_add(ctx, sum, abs_diff);
+        return ggml_scale(ctx, sum_abs, 0.5f);
+    }
+
+    h2o_sum_exp_result h2o_logits_sum_exp_with_max(ggml_context * ctx, ggml_tensor * logits) {
         ggml_tensor * logits_f32 = logits->type == GGML_TYPE_F32 ? logits : ggml_cast(ctx, logits, GGML_TYPE_F32);
         if (!ggml_is_contiguous(logits_f32)) {
             logits_f32 = ggml_cont(ctx, logits_f32);
         }
-        constexpr float k_clamp_min = -50.0f;
-        constexpr float k_clamp_max =  50.0f;
-        ggml_tensor * logits_clamped = ggml_clamp(ctx, logits_f32, k_clamp_min, k_clamp_max);
-        ggml_tensor * exp_logits = ggml_exp(ctx, logits_clamped);
-        return ggml_sum_rows(ctx, exp_logits);
+
+        ggml_tensor * m = ggml_max_rows(ctx, logits_f32);
+        ggml_tensor * m_broadcast = ggml_repeat(ctx, m, logits_f32);
+        ggml_tensor * logits_shifted = ggml_sub(ctx, logits_f32, m_broadcast);
+
+        constexpr float k_softmax_ftz_threshold = -20.0f;
+        ggml_tensor * ftz_mask = ggml_step(ctx, ggml_add(ctx, logits_shifted, ggml_new_f32(ctx, -k_softmax_ftz_threshold)));
+
+        ggml_tensor * exp_logits = ggml_exp(ctx, logits_shifted);
+        exp_logits = ggml_mul(ctx, exp_logits, ftz_mask);
+
+        ggml_tensor * l = ggml_sum_rows(ctx, exp_logits);
+        return {m, l};
     }
 
     ggml_tensor * h2o_as_per_head_output(ggml_context * ctx, ggml_tensor * out, ggml_tensor * logits) {
@@ -2154,7 +2245,7 @@ void llm_graph_context::init_online_softmax_state_h2o(
         ggml_tensor * inter_logits,
         ggml_tensor * v_mem,
         llm_graph_result::h2o_online_softmax_state & state) const {
-    ggml_tensor * z_inter = h2o_logits_sum_exp(ctx0, inter_logits);
+    auto [m_inter, l_inter] = h2o_logits_sum_exp_with_max(ctx0, inter_logits);
     ggml_tensor * kqv = nullptr;
 
     const bool v_is_values = v_mem->ne[1] == inter_logits->ne[0] && v_mem->ne[2] == inter_logits->ne[2];
@@ -2175,15 +2266,9 @@ void llm_graph_context::init_online_softmax_state_h2o(
         kqv = h2o_as_per_head_output(ctx0, v_mem, inter_logits);
     }
 
-    ggml_tensor * z_broadcast = ggml_repeat(ctx0, z_inter, kqv);
-    if (z_broadcast->type != kqv->type) {
-        z_broadcast = ggml_cast(ctx0, z_broadcast, kqv->type);
-    }
-    ggml_tensor * o_inter = ggml_mul(ctx0, kqv, z_broadcast);
-
-    state.m = ggml_log(ctx0, z_inter);
-    state.l = z_inter;
-    state.o = o_inter;
+    state.m = m_inter;
+    state.l = l_inter;
+    state.o = kqv;
     state.initialized = true;
 }
 
@@ -2191,7 +2276,7 @@ ggml_tensor * llm_graph_context::update_online_softmax_state_h2o(
         llm_graph_result::h2o_online_softmax_state & state,
         ggml_tensor * intra_logits,
         ggml_tensor * v_intra) const {
-    ggml_tensor * z_intra = h2o_logits_sum_exp(ctx0, intra_logits);
+    auto [m_intra, l_intra] = h2o_logits_sum_exp_with_max(ctx0, intra_logits);
     ggml_tensor * kqv = nullptr;
 
     const bool v_is_values = v_intra->ne[1] == intra_logits->ne[0] && v_intra->ne[2] == intra_logits->ne[2];
@@ -2212,27 +2297,51 @@ ggml_tensor * llm_graph_context::update_online_softmax_state_h2o(
         kqv = h2o_as_per_head_output(ctx0, v_intra, intra_logits);
     }
 
-    ggml_tensor * z_broadcast = ggml_repeat(ctx0, z_intra, kqv);
-    if (z_broadcast->type != kqv->type) {
-        z_broadcast = ggml_cast(ctx0, z_broadcast, kqv->type);
+    if (state.o && kqv->type != state.o->type) {
+        kqv = ggml_cast(ctx0, kqv, state.o->type);
     }
-    ggml_tensor * o_intra = ggml_mul(ctx0, kqv, z_broadcast);
 
-    ggml_tensor * o_total = state.initialized ? ggml_add(ctx0, state.o, o_intra) : o_intra;
-    ggml_tensor * z_total = state.initialized ? ggml_add(ctx0, state.l, z_intra) : z_intra;
-
-    ggml_tensor * z_total_broadcast = ggml_repeat(ctx0, z_total, o_total);
-    if (z_total_broadcast->type != o_total->type) {
-        z_total_broadcast = ggml_cast(ctx0, z_total_broadcast, o_total->type);
+    if (!state.initialized) {
+        state.m = m_intra;
+        state.l = l_intra;
+        state.o = kqv;
+        state.initialized = true;
+        return kqv;
     }
-    ggml_tensor * out = ggml_div(ctx0, o_total, z_total_broadcast);
 
-    state.m = ggml_log(ctx0, z_total);
-    state.l = z_total;
+    ggml_tensor * m_total = h2o_pairwise_max(ctx0, state.m, m_intra);
+    ggml_tensor * scale_old = ggml_exp(ctx0, ggml_sub(ctx0, state.m, m_total));
+    ggml_tensor * scale_new = ggml_exp(ctx0, ggml_sub(ctx0, m_intra, m_total));
+
+    ggml_tensor * l_old = ggml_mul(ctx0, state.l, scale_old);
+    ggml_tensor * l_new = ggml_mul(ctx0, l_intra, scale_new);
+    ggml_tensor * l_total = ggml_add(ctx0, l_old, l_new);
+
+    ggml_tensor * l_old_bc = ggml_repeat(ctx0, l_old, state.o);
+    ggml_tensor * l_new_bc = ggml_repeat(ctx0, l_new, kqv);
+    if (l_old_bc->type != state.o->type) {
+        l_old_bc = ggml_cast(ctx0, l_old_bc, state.o->type);
+    }
+    if (l_new_bc->type != kqv->type) {
+        l_new_bc = ggml_cast(ctx0, l_new_bc, kqv->type);
+    }
+
+    ggml_tensor * o_old = ggml_mul(ctx0, state.o, l_old_bc);
+    ggml_tensor * o_new = ggml_mul(ctx0, kqv, l_new_bc);
+    ggml_tensor * o_sum = ggml_add(ctx0, o_old, o_new);
+
+    ggml_tensor * l_total_bc = ggml_repeat(ctx0, l_total, o_sum);
+    if (l_total_bc->type != o_sum->type) {
+        l_total_bc = ggml_cast(ctx0, l_total_bc, o_sum->type);
+    }
+    ggml_tensor * o_total = ggml_div(ctx0, o_sum, l_total_bc);
+
+    state.m = m_total;
+    state.l = l_total;
     state.o = o_total;
     state.initialized = true;
 
-    return out;
+    return o_total;
 }
 
 ggml_tensor * llm_graph_context::build_attn_colsum(ggml_tensor * attn_weights, int il) const {
