@@ -1613,6 +1613,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         const uint32_t chunk_offset = chunk_idx * chunk_size;
                         const uint32_t chunk_len = std::min(chunk_size, n_tokens - chunk_offset);
                         const uint32_t chunk_start = base_tokens + chunk_offset;
+                        const uint32_t chunk_end = chunk_start + chunk_len;
 
                         for (const auto & layer : layers) {
                             const uint32_t n_kv = static_cast<uint32_t>(layer.tensor->ne[0]);
@@ -1630,6 +1631,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             }
 
                             kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
+                            kv->h2o_build_memory_set(layer.il, chunk_end);
                         }
 
                         kv->h2o_next_chunk(chunk_len);

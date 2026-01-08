@@ -1182,6 +1182,11 @@ void llama_kv_cache::h2o_build_memory_set(int32_t il, uint32_t chunk_end) {
     }
 
     h2o_memory_initialized = true;
+
+    if (debug >= 2) {
+        LLAMA_LOG_DEBUG("%s: [H2O] layer %d chunk_end=%u: memory set initialized (L=%u H=%u)\n",
+                __func__, il, chunk_end, L, H);
+    }
 }
 
 ggml_tensor * llama_kv_cache::h2o_gather_k_memory(ggml_context * ctx, int32_t il) const {
