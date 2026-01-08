@@ -51,10 +51,14 @@ $$\text{Attn}(Q_i) = \text{softmax}\left(\frac{Q_i \cdot [K_{\text{intra}}; K_{\
 
 The online softmax maintains running statistics $(m, \ell, o)$ that allow combining partial softmax results from multiple key blocks into an exact final result. This is the same principle used in FlashAttention for tiled computation, but here applied to fuse structurally different attention patterns (intra vs inter).
 
-**Processing Order**: For each chunk $C_c$ (where $c \geq 1$):
-1. Compute **intra-attention**: $Q(C_c) \times K(C_c)^T$ with causal mask → partial result + online softmax state
-2. Compute **inter-attention**: $Q(C_c) \times K(\mathcal{M}_{c-1})^T$ without mask → update online softmax state
-3. **Fuse** using online softmax to get final attention output
+**Execution Schedule (Prefill)**:
+- **Phase 1 (Parallel)**: All chunks compute **intra-attention** simultaneously:
+  - $Q(C_c) \times K(C_c)^T$ with causal mask → store intra logits/output
+  - Initialize scores for tokens in $C_c$ from intra-attention column sums
+- **Phase 2 (Sequential)**: For each chunk $C_c$ (where $c \geq 1$):
+  1. Compute **inter-attention**: $Q(C_c) \times K(\mathcal{M}_{c-1})^T$ (no mask)
+  2. **Update scores** for tokens in $\mathcal{M}_{c-1}$ using inter-attention weights
+  3. **Fuse** inter + stored intra results via online softmax to get final output
 
 #### 1.2.3 Memory Set Construction (H2O-like Selection)
 
@@ -74,11 +78,15 @@ $$\mathcal{M}_c = \underbrace{\text{Local}_c}_{\text{forced retention}} \cup \un
 
 #### 1.2.4 Score Update Mechanism (Chunk-Level, Not Token-Level)
 
-**Critical Difference from Standard H2O**: In decode-phase H2O, scores are updated after **every generated token**. In our prefill method, scores are updated **once per chunk**, specifically after the inter-attention pass.
+**Critical Difference from Standard H2O**: In decode-phase H2O, scores are updated after **every generated token**. In our prefill method, scores are **initialized once per chunk** from intra-attention, and **accumulated once per chunk** after the inter-attention pass.
 
-**When Scores Update**: After computing inter-attention for chunk $C_c$ against memory $\mathcal{M}_{c-1}$
+**When Scores Update**:
+- **Initialization** (Phase 1): After computing intra-attention for chunk $C_c$, initialize scores for tokens in $C_c$
+- **Accumulation** (Phase 2): After computing inter-attention for chunk $C_c$ against memory $\mathcal{M}_{c-1}$
 
-**What Gets Updated**: Only tokens in the current memory set $\mathcal{M}_{c-1}$
+**What Gets Updated**:
+- **Initialization**: Tokens in the current chunk $C_c$
+- **Accumulation**: Only tokens in the current memory set $\mathcal{M}_{c-1}$
 
 **Update Formula** (per-head, per-layer):
 $$\text{score}(j) \mathrel{+}= \sum_{i \in C_c} A_{\text{inter}}(i, j), \quad \forall j \in \mathcal{M}_{c-1}$$
@@ -91,51 +99,45 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     INITIALIZATION: Process C₀                       │
+│              PHASE 1 (PARALLEL): INTRA-ATTN FOR ALL CHUNKS           │
 ├─────────────────────────────────────────────────────────────────────┤
-│  • C₀ has NO history → only intra-attention                         │
-│  • Compute: intra(C₀) with 1024×1024 causal mask                    │
-│  • Initialize scores from intra(C₀) column-sum                      │
-│  • Build M₀ for C₁:                                                 │
-│      - Local₀ = C₀[768:1024] (tail 256 tokens)                      │
-│      - Heavy₀ = Top-256 from C₀[0:768] by intra-attention scores    │
+│  • Split prompt into chunks C₀..Cₖ₋₁                                │
+│  • For each chunk C_c in parallel:                                  │
+│      - Compute intra(C_c) with causal mask                           │
+│      - Store K/V + intra logits/output                               │
+│      - Initialize scores from intra(C_c) column-sum                  │
 └─────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     PROCESS C₁ (first inter-chunk)                   │
+│                  BUILD M₀ (READY FOR C₁ INTER-ATTN)                  │
 ├─────────────────────────────────────────────────────────────────────┤
+│  • Local₀ = C₀[768:1024] (tail 256 tokens)                          │
+│  • Heavy₀ = Top-256 from C₀[0:768] by intra scores                  │
+│  • M₀ = Local₀ ∪ Heavy₀                                             │
+└─────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│          PHASE 2 (SEQUENTIAL): INTER-ATTN + FUSION (c ≥ 1)           │
+├─────────────────────────────────────────────────────────────────────┤
+│  For each chunk C_c in order (c = 1, 2, ...):                        │
+│                                                                     │
 │  Step 1: Inter-attention                                            │
-│      • Q(C₁) × K(M₀)ᵀ → A_inter [1024 × 512]                        │
-│      • Get partial output + online softmax state                    │
+│      • Q(C_c) × K(M_{c-1})ᵀ → A_inter [S × M]                       │
 │                                                                     │
-│  Step 2: Score Update                                               │
-│      • For each j ∈ M₀: score(j) += Σᵢ A_inter(i,j)                 │
-│      • Only M₀ tokens get score updates                             │
+│  Step 2: Score Update (memory only)                                 │
+│      • For each j ∈ M_{c-1}: score(j) += Σᵢ A_inter(i,j)            │
 │                                                                     │
-│  Step 3: Intra-attention                                            │
-│      • Q(C₁) × K(C₁)ᵀ → A_intra [1024 × 1024, causal]               │
-│      • Update online softmax state                                  │
-│      • Fuse → final attention output                                │
+│  Step 3: Online Softmax Fusion                                      │
+│      • Initialize state from inter-attention                        │
+│      • Update with stored intra(C_c) logits/output                  │
+│      • Fuse → final attention output for C_c                         │
 │                                                                     │
-│  Step 4: Build M₁ for C₂                                            │
-│      • Local₁ = C₁[768:1024]                                        │
-│      • Candidates = (M₀ ∪ C₁[0:768])                                │
-│      • Heavy₁ = Top-256 from Candidates by score                    │
-│      • M₁ = Local₁ ∪ Heavy₁                                         │
-└─────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                     PROCESS Cₖ (general case, k ≥ 1)                 │
-├─────────────────────────────────────────────────────────────────────┤
-│  Step 1: Inter-attention Q(Cₖ) × K(Mₖ₋₁)ᵀ                           │
-│  Step 2: Score update for tokens in Mₖ₋₁                            │
-│  Step 3: Intra-attention Q(Cₖ) × K(Cₖ)ᵀ + fusion                    │
-│  Step 4: Build Mₖ = Localₖ ∪ Heavyₖ                                 │
-│                                                                     │
-│  Heavy selection allows CROSS-CHUNK PROPAGATION:                    │
-│  • If token from C₀ in M₀ gets high score in C₁'s inter-attn       │
-│  • It enters M₁, so C₂ can still "see" it                          │
-│  • Important historical context survives across many chunks         │
+│  Step 4: Build M_c for next chunk                                   │
+│      • Local_c = tail of C_c (recent tokens)                        │
+│      • Candidates = (M_{c-1} ∪ C_c[0:S-L])                          │
+│      • Heavy_c = Top-H from Candidates by score                      │
+│      • M_c = Local_c ∪ Heavy_c                                      │
+│      • Drop non-selected tokens (keep only M_c for next step)       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1043,4 +1045,3 @@ $$C_{\text{ours}} = O(N(S + M)) = O(N(S + L + H))$$
 + 由于当前编程框架是 llama.cpp 框架, 它提供了2个有关 batch 的操作 -b 和 -ub. 为了和我们例子对齐, 实际运行的时候, 我们会传入 -b设置为 4096, -ub 设计为1024. 并且在第一阶段prefill阶段, -b中的所有物理批都是并行计算prefill chunk 内的注意力的.
     * **-b 逻辑批大小 默认2048, 相当于**虽然你有 4096 个 token，但单次只能提交 2048 个给 llama_decode()
     * -ub 物理批大小 默认512,  这 2048 个 token 被 -ub（物理批大小）分割, preifll 阶段顺序执行4个物理批, 一次处理512 token
-
