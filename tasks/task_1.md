@@ -73,17 +73,24 @@ struct h2o_chunk_state {
 bool h2o_memory_initialized = false;
 ```
 
-**Memory Layout**:
+**Memory Layout** (matches llama.cpp implementation):
 ```
 h2o_scores[il]:
   Type: BF16 (2 bytes per element)
-  Shape: [kv_size, n_head]
+  Shape: [kv_size, n_head] where kv_size = max_seq_len, n_head = num_heads
+  Stride: ne[0] = kv_size, ne[1] = n_head
   Access: score_data[head * kv_size + pos]
+  
+  Note: Conceptually [num_heads, max_seq_len] per layer, but stored as [kv_size, n_head]
+        for contiguous memory layout per position.
 
 h2o_memory_indices[il]:
   Type: I32 (4 bytes per element)
-  Shape: [M, n_head]
-  Layout: [0..L-1] = local, [L..M-1] = heavy (sorted)
+  Shape: [M, n_head] where M = h2o_memory_size = L + H
+  Stride: ne[0] = M, ne[1] = n_head
+  Access: mem_idx_data[head * M + m]
+  Layout: Per head, indices [0..L-1] = local window, [L..M-1] = heavy hitters
+          All indices within each head are sorted for coalesced memory access.
 ```
 
 **Verification**:

@@ -1,15 +1,20 @@
-# Task 4: Memory Set Selection Integration for H2O Chunked Sparse Attention
+# Task 4: Memory Set Selection Validation for H2O Chunked Sparse Attention
 
 ## Overview
 
-This task integrates the H2O memory set selection mechanism into the main prefill execution path. The **core implementation already exists** from Task 1 (in `llama-kv-cache.cpp`), but it is not yet called during inference. This task wires `h2o_build_memory_set` into the chunk processing loop so that memory sets (Local + Heavy hitters) are constructed and ready for inter-chunk attention in Task 5.
+This task **validates** the H2O memory set selection mechanism (`h2o_build_memory_set`) implemented in Task 1. The actual integration into the execution path happens in **Task 5** as part of Phase 2 processing.
 
-**Scope**: Integration and validation only. Inter-chunk attention and online softmax fusion are deferred to Task 5.
+**Key Clarification (Two-Phase Design)**:
+- Memory set M₀ is built **after Phase 1 completes** (i.e., after all chunks finish intra-attention in parallel)
+- Memory sets M₁, M₂, ... are built **during Phase 2** (sequential processing), after each chunk's inter-attention
+- **This task does NOT add `h2o_build_memory_set` calls per-chunk in Phase 1** - that happens in Task 5's Phase 2
+
+**Scope**: Validation of Task 1 implementation through unit tests. Integration into Phase 2 is deferred to Task 5.
 
 **Dependencies**:
 - ✅ Task 1: H2O data structures (`h2o_scores`, `h2o_memory_indices`, `h2o_build_memory_set`)
 - ✅ Task 2: Intra-chunk attention with weight extraction
-- ✅ Task 3: Score tracking integration (`h2o_init_chunk_scores`, `h2o_next_chunk`)
+- ✅ Task 3: Score tracking integration (`h2o_init_chunk_scores`) - Phase 1 only, no `h2o_next_chunk` calls
 
 ---
 
@@ -34,74 +39,63 @@ This function implements:
 - `h2o_gather_k_memory(ctx, il)` - Gather K for memory set
 - `h2o_gather_v_memory(ctx, il)` - Gather V for memory set
 
-### Current Execution Flow (Task 3)
+### Current Execution Flow (Task 3 - Phase 1 Only)
 
-**File**: `src/llama-context.cpp:1612-1636`
+**File**: `src/llama-context.cpp`
+
+After Phase 1 graph compute (all chunks processed in parallel via block-diagonal mask):
 
 ```cpp
+// Phase 1: Initialize scores for all chunks (NO h2o_next_chunk calls here!)
 for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
     // ... extract chunk_colsum from t_h2o_colsum ...
-
     kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
-
-    kv->h2o_next_chunk(chunk_len);  // ← Task 4: Add h2o_build_memory_set HERE
+    // DO NOT call h2o_next_chunk() or h2o_build_memory_set() here!
 }
+// Phase 2 (Task 5): Sequential processing with inter-attention + memory set building
 ```
 
-**What's missing**: `h2o_build_memory_set` is never called!
+**Memory Set Build Timing (implemented in Task 5)**:
+1. After Phase 1 completes → Build M₀ from chunk 0 scores
+2. After each chunk c's inter-attention in Phase 2 → Build Mₖ for next chunk
 
 ---
 
 ## Implementation Steps
 
-### Step 1: Add Memory Set Construction to Chunk Loop
+### Step 1: Validate Memory Set Construction Logic (Unit Tests Only)
 
-**File**: `src/llama-context.cpp` (around line 1635)
+**Clarification**: This task validates the `h2o_build_memory_set` implementation from Task 1 through unit tests. The actual **integration** into the main execution path is done in **Task 5**.
 
-**Modification**: Add `h2o_build_memory_set` call after score initialization for each layer, before `h2o_next_chunk`.
+**Why NOT add per-chunk memory set construction in Phase 1**:
+- In the two-phase design, Phase 1 processes all chunks in parallel (intra-attention only)
+- Memory set M₀ should only be built **after Phase 1 completes**, not during Phase 1 chunk processing
+- Memory sets M₁, M₂, ... are built **during Phase 2**, after each chunk's inter-attention
+- Building memory sets per-chunk in Phase 1 is wasteful since those sets would not be used until Phase 2
 
+**Task 4 Scope**:
+1. Write unit tests to validate `h2o_build_memory_set` logic
+2. Verify local window extraction, heavy hitter selection, cross-chunk propagation
+3. Ensure sorted indices and proper memory constraints
+
+**Integration (Task 5 - Phase 2)**:
 ```cpp
-for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
-    const uint32_t chunk_offset = chunk_idx * chunk_size;
-    const uint32_t chunk_len = std::min(chunk_size, n_tokens - chunk_offset);
-    const uint32_t chunk_start = base_tokens + chunk_offset;
-    const uint32_t chunk_end = chunk_start + chunk_len;
+// Phase 2 pseudocode (implemented in Task 5, NOT Task 4)
+// After Phase 1 completes:
+h2o_build_memory_set(il, S);  // Build M₀ from chunk 0
 
-    // Initialize scores from intra-attention colsum
-    for (const auto & layer : layers) {
-        // ... existing code to extract and set chunk_colsum ...
-
-        kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
-
-        // *** NEW: Build memory set for next chunk ***
-        kv->h2o_build_memory_set(layer.il, chunk_end);
-    }
-
-    kv->h2o_next_chunk(chunk_len);
+for (chunk_idx = 1; chunk_idx < n_chunks; ++chunk_idx) {
+    // Inter-attention with M_{c-1}
+    // Score accumulation for memory tokens
+    // Online softmax fusion
+    h2o_build_memory_set(il, chunk_end);  // Build Mₖ for next chunk
+    h2o_next_chunk(chunk_len);
 }
 ```
-
-**Key details**:
-- Call `h2o_build_memory_set` **once per layer** after initializing scores
-- Pass `chunk_end` (not `chunk_len`) - it needs the global end position
-- This prepares memory set M_c for the **next** chunk C_{c+1}
-- For chunk 0, this builds M_0 for chunk 1
-- For the final chunk, memory set is built but won't be used (OK for now, Task 5 will use it)
 
 ---
 
 ### Step 2: Add Debug Logging (Optional but Recommended)
-
-**File**: `src/llama-context.cpp`
-
-Add logging to track memory set construction:
-
-```cpp
-if (kv->debug >= 1) {
-    LLAMA_LOG_DEBUG("%s: [H2O] chunk %u: built memory set for layer %d (chunk_end=%u)\n",
-                    __func__, chunk_idx, layer.il, chunk_end);
-}
-```
 
 **File**: `src/llama-kv-cache.cpp:1184` (end of `h2o_build_memory_set`)
 
@@ -126,17 +120,7 @@ if (debug >= 2) {
 h2o_memory_initialized = true;
 ```
 
-**Verification**: Ensure this flag is checked before calling gather methods:
-
-```cpp
-ggml_tensor * llama_kv_cache::h2o_gather_k_memory(...) const {
-    GGML_ASSERT(h2o_memory_initialized);  // ✅ Already present
-    // ...
-}
-```
-
----
-
+**Verification**: Ensure this flag is checked before calling gather methods.
 ## Validation & Verification Metrics
 
 ### Metric 1: Local Window Correctness

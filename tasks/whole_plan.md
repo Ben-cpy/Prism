@@ -19,7 +19,11 @@ $$\text{Total FLOPs} \propto \sum_{t=1}^{N} t = \frac{N(N+1)}{2} = O(N^2)$$
 ### 1.2 Proposed Method: Block-Sparse Causal Attention Approximation
 
 We replace full causal attention with a **block-sparse approximation** that maintains:
-- **Intra-chunk**: Full causal attention within each chunk, In this architecture, given that our prefill phase no longer relies on sequential dependencies, attention calculation within each intra-chunk iteration is executed in parallel. For instance, a 4096-token prompt is segmented into four 1024-token chunks, and these four chunks initially undergo internal parallel prefill computation (thereby augmenting throughput).
+- **Intra-chunk**: Full causal attention within each chunk. In this architecture, given that our prefill phase no longer relies on sequential dependencies, attention calculation within each intra-chunk iteration is executed in parallel. For instance, a 4096-token prompt is segmented into four 1024-token chunks, and these four chunks initially undergo internal parallel prefill computation (thereby augmenting throughput).
+  - **Block-Diagonal Causal Mask**: To enable parallel processing of all chunks in Phase 1, we use a block-diagonal causal mask. For each query position $i$, keys are only visible in $[\text{chunk\_start}(i), i]$ where $\text{chunk\_start}(i) = \lfloor i/S \rfloor \cdot S$. This ensures:
+    - Within each chunk: standard causal masking (token at position $i$ can only attend to positions $\leq i$)
+    - Across chunks: no attention (query in chunk $c$ cannot see keys from chunk $c' \neq c$ during Phase 1)
+    - Result: All chunks can compute intra-attention simultaneously without cross-chunk dependencies
 - **Inter-chunk**: Attention only to a bounded subset $\mathcal{M}_c$ of historical KV pairs
 
 #### 1.2.1 Notation
@@ -381,6 +385,13 @@ class ScoreTracker:
     
     Attributes:
         scores: Tensor[num_layers, num_heads, max_seq_len]
+    
+    Implementation Note (llama.cpp):
+        In C++ implementation, scores are stored as per-layer tensors:
+        - h2o_scores[il]: Tensor[kv_size, n_head] (BF16)
+        - Access pattern: score_data[pos * n_head + head] or score_data[head * kv_size + pos]
+        The conceptual shape [num_layers, num_heads, max_seq_len] is achieved via
+        vector<ggml_tensor*> h2o_scores with one [kv_size, n_head] tensor per layer.
     """
     
     def __init__(self, num_layers: int, num_heads: int, max_seq_len: int):
@@ -509,6 +520,9 @@ def build_memory_set(
 def gather_memory_kv(
     kv_cache: Tensor,         # [num_layers, 2, num_heads, max_seq_len, head_dim]
     memory_indices: Tensor,   # [num_layers, num_heads, M]
+                              # Implementation Note: In llama.cpp, stored as per-layer tensors:
+                              # h2o_memory_indices[il]: Tensor[M, n_head] (I32)
+                              # Access: mem_idx_data[m * n_head + head] or mem_idx_data[head * M + m]
 ) -> Tuple[Tensor, Tensor]:   # K: [num_layers, num_heads, M, head_dim], V: same
     """
     Gather K, V for memory set.

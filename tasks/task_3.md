@@ -102,21 +102,26 @@ We treat each ubatch as a chunk and **compute all chunks within one logical batc
 
 ---
 
-### Step 5: Update scores after compute (chunk = ubatch)
+### Step 5: Phase 1 - Initialize scores from intra-attention (parallel)
 
 **File**: `src/llama-context.cpp`
 
-After `graph_compute(...)`:
+After `graph_compute(...)` for **Phase 1** (all chunks processed in parallel via block-diagonal mask):
 - If H2O enabled and `ubatch.n_tokens > 1` (prefill path), read `t_h2o_colsum` tensors back to host.
 - For each chunk in the batch:
   - `chunk_start = kv.h2o_get_total_tokens() + chunk_idx * chunk_size`
   - `chunk_len = min(chunk_size, remaining)`
   - call `kv.h2o_init_chunk_scores(il, chunk_start, chunk_len, colsum_slice)`
-  - call `kv.h2o_next_chunk(chunk_len)` to advance chunk state
+  - **DO NOT** call `kv.h2o_next_chunk(chunk_len)` here - chunk state advancement happens in Phase 2
 
-**Important**:
-- For Task 3, we **only initialize scores** from intra-attn colsum.
-- Inter-attn score accumulation (`h2o_accumulate_memory_scores`) will be wired in Task 5.
+**Important (Two-Phase Design)**:
+- **Phase 1** (this step): All chunks compute intra-attention in parallel. We only initialize scores from intra-attn colsum for all chunks. No memory set construction yet.
+- **Phase 2** (Task 5): Sequential processing where:
+  1. Build M₀ from chunk 0 scores (after Phase 1 completes)
+  2. For chunks 1,2,3...: inter-attn → score accumulation → online softmax fusion → build Mₖ
+  3. Call `h2o_next_chunk()` after each chunk completes in Phase 2
+
+**Note**: `h2o_next_chunk()` is called in **Phase 2 only**, after inter-attention and memory set construction for each chunk. This ensures proper sequencing for cross-chunk propagation.
 
 ---
 
@@ -171,6 +176,16 @@ ctest --test-dir build -R test-h2o-score-tracking -V --output-on-failure
 ---
 
 ## Notes for later tasks
-- Inter-attn score updates (`h2o_accumulate_memory_scores`) are deferred to Task 5.
-- Memory selection (Local + Heavy) is Task 4.
-- Online softmax fusion is Task 5.
+
+**Two-Phase Processing Architecture**:
+- **Phase 1** (Task 3): All chunks compute intra-attention in parallel using block-diagonal causal mask. Initialize scores for all chunks from intra-attention column sums.
+- **Phase 2** (Task 5): Sequential processing for chunks 1+ with inter-attention, online softmax fusion, and memory set construction.
+
+**Deferred to Task 4**:
+- Memory selection (Local + Heavy) logic is implemented in Task 1, but **called only in Phase 2** of Task 5
+- `h2o_build_memory_set()` is called **after Phase 1 completes** for chunk 0, then after each chunk's inter-attention in Phase 2
+
+**Deferred to Task 5**:
+- Inter-attn score accumulation (`h2o_accumulate_memory_scores`)
+- Online softmax fusion of inter + intra attention
+- `h2o_next_chunk()` calls (in Phase 2 only)
