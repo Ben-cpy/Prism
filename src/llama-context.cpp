@@ -1472,7 +1472,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     while (true) {
         const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
-        const uint32_t ubatch_size = h2o_enabled ? cparams.n_batch : cparams.n_ubatch;
+        const uint32_t ubatch_size = h2o_enabled
+            ? (cparams.n_ubatch > 0 ? cparams.n_ubatch : cparams.n_batch)
+            : cparams.n_ubatch;
         mctx = memory->init_batch(*balloc, ubatch_size, output_all);
         if (!mctx) {
             return -2;
@@ -1525,6 +1527,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+        const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
 
         // count the outputs in this ubatch
         {
@@ -1543,7 +1546,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
+        const int prev_phase = current_phase;
+        if (h2o_enabled && ubatch.n_tokens > 1) {
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            current_phase = (kv != nullptr && kv->h2o_is_memory_initialized()) ? 2 : 1;
+        } else {
+            current_phase = 0;
+        }
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        current_phase = prev_phase;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1576,7 +1587,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
         if (h2o_enabled && ubatch.n_tokens > 1 && !res->t_h2o_colsum.empty()) {
             auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
             if (kv != nullptr && cparams.n_ubatch > 0) {
@@ -1586,8 +1596,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     std::vector<float> data;
                 };
 
-                std::vector<h2o_colsum_layer> layers;
-                layers.reserve(res->t_h2o_colsum.size());
+                std::vector<h2o_colsum_layer> intra_layers;
+                intra_layers.reserve(res->t_h2o_colsum.size());
+
+                std::map<int32_t, h2o_colsum_layer> inter_layers;
 
                 for (auto & [il, t_colsum] : res->t_h2o_colsum) {
                     if (t_colsum == nullptr) {
@@ -1600,10 +1612,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     layer.data.resize(ggml_nelements(t_colsum));
                     ggml_backend_tensor_get(t_colsum, layer.data.data(), 0, layer.data.size() * sizeof(float));
 
-                    layers.push_back(std::move(layer));
+                    intra_layers.push_back(std::move(layer));
                 }
 
-                if (!layers.empty()) {
+                for (auto & [il, t_colsum] : res->t_h2o_inter_colsum) {
+                    if (t_colsum == nullptr) {
+                        continue;
+                    }
+
+                    h2o_colsum_layer layer;
+                    layer.il = il;
+                    layer.tensor = t_colsum;
+                    layer.data.resize(ggml_nelements(t_colsum));
+                    ggml_backend_tensor_get(t_colsum, layer.data.data(), 0, layer.data.size() * sizeof(float));
+
+                    inter_layers.emplace(il, std::move(layer));
+                }
+
+                if (!intra_layers.empty()) {
                     const uint32_t chunk_size = cparams.n_ubatch;
                     const uint32_t n_tokens = ubatch.n_tokens;
                     const uint32_t n_chunks = (n_tokens + chunk_size - 1) / chunk_size;
@@ -1615,7 +1641,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         const uint32_t chunk_start = base_tokens + chunk_offset;
                         const uint32_t chunk_end = chunk_start + chunk_len;
 
-                        for (const auto & layer : layers) {
+                        for (const auto & layer : intra_layers) {
                             const uint32_t n_kv = static_cast<uint32_t>(layer.tensor->ne[0]);
                             const uint32_t n_head = static_cast<uint32_t>(layer.tensor->ne[1]);
                             const uint32_t n_stream = static_cast<uint32_t>(layer.tensor->ne[2]);
@@ -1631,6 +1657,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             }
 
                             kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
+
+                            auto it = inter_layers.find(layer.il);
+                            if (it != inter_layers.end()) {
+                                kv->h2o_accumulate_memory_scores(layer.il, it->second.data.data());
+                            }
+
                             kv->h2o_build_memory_set(layer.il, chunk_end);
                         }
 
@@ -2120,6 +2152,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.current_phase =*/ current_phase,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

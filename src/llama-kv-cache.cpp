@@ -2321,6 +2321,18 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
+bool llama_kv_cache_context::h2o_is_memory_initialized() const {
+    return kv->h2o_is_memory_initialized();
+}
+
+ggml_tensor * llama_kv_cache_context::h2o_gather_k_memory(ggml_context * ctx, int32_t il) const {
+    return kv->h2o_gather_k_memory(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::h2o_gather_v_memory(ggml_context * ctx, int32_t il) const {
+    return kv->h2o_gather_v_memory(ctx, il);
+}
+
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }

@@ -253,6 +253,7 @@ private:
     const llama_model & model;
 
     llama_cparams       cparams;
+    int                current_phase = 0; // 0=normal, 1=phase1, 2=phase2
     llama_adapter_cvec  cvec;
     llama_adapter_loras loras;
 

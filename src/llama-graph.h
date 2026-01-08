@@ -444,6 +444,8 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    int current_phase = 0; // 0=normal, 1=phase1, 2=phase2
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -499,6 +501,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (current_phase != other.current_phase) {
             return false;
         }
 
@@ -574,6 +580,24 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
     std::map<int, ggml_tensor *> t_h2o_colsum;
+    std::map<int, ggml_tensor *> t_h2o_inter_colsum;
+
+    // Online softmax state for chunked attention fusion
+    struct h2o_online_softmax_state {
+        ggml_tensor * m = nullptr; // [n_tokens, n_head] running max/logsumexp proxy (optional)
+        ggml_tensor * l = nullptr; // [n_tokens, n_head] running sum exp(logit - m)
+        ggml_tensor * o = nullptr; // [n_embd_head_v, n_tokens, n_head] running weighted sum
+        bool initialized = false;
+    };
+
+    // Storage for phase outputs and fusion state
+    struct h2o_phase_state {
+        std::map<int, ggml_tensor *> intra_output;   // [il] -> output tensor
+        std::map<int, ggml_tensor *> intra_logits;   // [il] -> logits before softmax
+        std::map<int, h2o_online_softmax_state> online_state; // [il] -> state
+    };
+
+    h2o_phase_state h2o_phase;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -651,6 +675,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const int current_phase;
 
     const llm_graph_cb & cb_func;
 
@@ -787,7 +813,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,
                   float   kq_scale,
                     int   il,
-            ggml_tensor ** attn_weights_out) const;
+            ggml_tensor ** attn_weights_out,
+            ggml_tensor ** attn_logits_out = nullptr) const;
 
     // H2O attention with KV cache storage and weight extraction
     ggml_tensor * build_attn_h2o(
@@ -803,6 +830,25 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor ** attn_weights_out) const;
+
+    ggml_tensor * build_attn_inter_h2o(
+            ggml_tensor * q,
+            ggml_tensor * k_mem,
+            ggml_tensor * v_mem,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor ** inter_logits_out,
+            ggml_tensor ** inter_weights_out) const;
+
+    void init_online_softmax_state_h2o(
+            ggml_tensor * inter_logits,
+            ggml_tensor * v_mem,
+            llm_graph_result::h2o_online_softmax_state & state) const;
+
+    ggml_tensor * update_online_softmax_state_h2o(
+            llm_graph_result::h2o_online_softmax_state & state,
+            ggml_tensor * intra_logits,
+            ggml_tensor * v_intra) const;
 
     // Compute column sum of attention weights for H2O score tracking
     // Input: attn_weights [n_kv, n_tokens, n_head, n_stream]

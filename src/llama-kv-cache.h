@@ -380,6 +380,11 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    // H2O helpers (valid when swa_type == LLAMA_SWA_TYPE_H2O)
+    bool h2o_is_memory_initialized() const;
+    ggml_tensor * h2o_gather_k_memory(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * h2o_gather_v_memory(ggml_context * ctx, int32_t il) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be layed out contiguously in memory
     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
