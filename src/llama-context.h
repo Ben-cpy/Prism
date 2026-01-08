@@ -32,6 +32,18 @@ struct llama_memory_breakdown_data {
     }
 };
 
+struct h2o_prefill_cache {
+    // per layer:
+    std::vector<std::vector<float>> intra_o; // [il] -> [n_embd_head_v * n_tokens * n_head * n_stream]
+    std::vector<std::vector<float>> intra_l; // [il] -> [n_tokens * n_head * n_stream]
+    uint32_t n_tokens = 0;
+    uint32_t n_head = 0;
+    uint32_t n_embd_head_v = 0;
+    uint32_t n_stream = 1;
+    llama_pos base_pos = 0;
+    bool initialized = false;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -254,6 +266,7 @@ private:
 
     llama_cparams       cparams;
     int                current_phase = 0; // 0=normal, 1=phase1, 2=phase2
+    h2o_prefill_cache  h2o_cache;
     llama_adapter_cvec  cvec;
     llama_adapter_loras loras;
 

@@ -1468,53 +1468,68 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
-    llama_memory_context_ptr mctx;
+    const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+    const bool h2o_prefill = h2o_enabled && n_tokens_all > 1;
+    const uint32_t h2o_chunk_size = h2o_enabled
+        ? (cparams.n_ubatch > 0 ? cparams.n_ubatch : cparams.n_batch)
+        : cparams.n_ubatch;
+    const uint32_t h2o_n_chunks = h2o_enabled
+        ? (n_tokens_all + h2o_chunk_size - 1) / h2o_chunk_size
+        : 0;
+    const bool h2o_two_phase = h2o_prefill && h2o_n_chunks > 1;
 
-    while (true) {
-        const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
-        const uint32_t ubatch_size = h2o_enabled
-            ? (cparams.n_ubatch > 0 ? cparams.n_ubatch : cparams.n_batch)
-            : cparams.n_ubatch;
-        mctx = memory->init_batch(*balloc, ubatch_size, output_all);
-        if (!mctx) {
-            return -2;
-        }
+    if (h2o_prefill) {
+        h2o_cache.initialized = false;
+    }
 
-        switch (mctx->get_status()) {
-            case LLAMA_MEMORY_STATUS_SUCCESS:
-                {
-                } break;
-            case LLAMA_MEMORY_STATUS_NO_UPDATE:
-                {
-                    LLAMA_LOG_ERROR("%s: unexpected memory context status: %d\n", __func__, mctx->get_status());
+    int init_err = 0;
+    auto init_mctx = [&](uint32_t ubatch_size) -> llama_memory_context_ptr {
+        while (true) {
+            auto ctx = memory->init_batch(*balloc, ubatch_size, output_all);
+            if (!ctx) {
+                init_err = -2;
+                return nullptr;
+            }
 
-                    return -2;
-                }
-            case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
-                {
-                    if (!did_optimize) {
-                        did_optimize = true;
-
-                        if (memory_update(true)) {
-                            LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
-
-                            continue;
-                        }
+            switch (ctx->get_status()) {
+                case LLAMA_MEMORY_STATUS_SUCCESS:
+                    return ctx;
+                case LLAMA_MEMORY_STATUS_NO_UPDATE:
+                    {
+                        LLAMA_LOG_ERROR("%s: unexpected memory context status: %d\n", __func__, ctx->get_status());
+                        init_err = -2;
+                        return nullptr;
                     }
+                case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
+                    {
+                        if (!did_optimize) {
+                            did_optimize = true;
 
-                    LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
+                            if (memory_update(true)) {
+                                LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
+                                continue;
+                            }
+                        }
 
-                    return 1;
-                }
-            case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
-                {
-                    LLAMA_LOG_ERROR("%s: compute failed while preparing batch of size %d\n", __func__, balloc->get_n_tokens());
-
-                    return -2;
-                }
+                        LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
+                        init_err = 1;
+                        return nullptr;
+                    }
+                case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+                    {
+                        LLAMA_LOG_ERROR("%s: compute failed while preparing batch of size %d\n", __func__, balloc->get_n_tokens());
+                        init_err = -2;
+                        return nullptr;
+                    }
+            }
         }
+    };
 
-        break;
+    const uint32_t phase1_ubatch_size = h2o_prefill ? cparams.n_batch : h2o_chunk_size;
+
+    llama_memory_context_ptr mctx = init_mctx(phase1_ubatch_size);
+    if (!mctx) {
+        return init_err;
     }
 
     // reserve output buffer
@@ -1524,258 +1539,345 @@ int llama_context::decode(const llama_batch & batch_inp) {
     };
 
     int64_t n_outputs_prev = 0;
+    uint32_t h2o_chunk_idx = 0;
+    bool h2o_cache_ready = false;
 
-    do {
-        const auto & ubatch = mctx->get_ubatch();
-        const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+    auto run_phase = [&](llama_memory_context_ptr & ctx, int phase, bool skip_outputs, uint32_t base_tokens) -> int {
+        do {
+            const auto & ubatch = ctx->get_ubatch();
 
-        // count the outputs in this ubatch
-        {
-            int32_t n_outputs_new = 0;
+            // count the outputs in this ubatch
+            {
+                int32_t n_outputs_new = 0;
 
-            if (n_outputs_all == n_tokens_all) {
-                n_outputs_new = ubatch.n_tokens;
-            } else {
-                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
+                if (n_outputs_all == n_tokens_all) {
+                    n_outputs_new = ubatch.n_tokens;
+                } else {
+                    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                        n_outputs_new += (int32_t) (ubatch.output[i] != 0);
+                    }
+                }
+
+                // needs to happen before the graph is built
+                n_outputs = n_outputs_new;
+            }
+
+            ggml_status status;
+            const int prev_phase = current_phase;
+            current_phase = phase;
+            const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, ctx.get(), status);
+            current_phase = prev_phase;
+
+            if (!res) {
+                // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+                llama_pos pos_min[LLAMA_MAX_SEQ];
+                for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    pos_min[s] = std::numeric_limits<llama_pos>::max();
+                }
+
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const auto & seq_id = ubatch.seq_id[i][0];
+
+                    pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                }
+
+                for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                        continue;
+                    }
+
+                    LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+
+                    memory->seq_rm(s, pos_min[s], -1);
+                }
+
+                switch (status) {
+                    case GGML_STATUS_ABORTED:      return  2;
+                    case GGML_STATUS_ALLOC_FAILED: return -2;
+                    case GGML_STATUS_FAILED:       return -3;
+                    case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
                 }
             }
 
-            // needs to happen before the graph is built
-            n_outputs = n_outputs_new;
-        }
+            auto * kv = h2o_enabled ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
 
-        ggml_status status;
-        const int prev_phase = current_phase;
-        if (h2o_enabled && ubatch.n_tokens > 1) {
-            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
-            current_phase = (kv != nullptr && kv->h2o_is_memory_initialized()) ? 2 : 1;
-        } else {
-            current_phase = 0;
-        }
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
-        current_phase = prev_phase;
+            if (h2o_two_phase && phase == 1 && !h2o_cache_ready && !res->t_h2o_intra_o.empty()) {
+                h2o_cache.intra_o.assign(hparams.n_layer, {});
+                h2o_cache.intra_l.assign(hparams.n_layer, {});
+                h2o_cache.n_tokens = ubatch.n_tokens;
+                h2o_cache.base_pos = ubatch.pos ? ubatch.pos[0] : 0;
+                h2o_cache.n_head = 0;
+                h2o_cache.n_embd_head_v = 0;
+                h2o_cache.n_stream = 1;
+                bool filled = false;
 
-        if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
+                for (const auto & [il, t_intra_o] : res->t_h2o_intra_o) {
+                    if (t_intra_o == nullptr) {
+                        continue;
+                    }
 
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
+                    const auto it_l = res->t_h2o_intra_l.find(il);
+                    if (it_l == res->t_h2o_intra_l.end() || it_l->second == nullptr) {
+                        continue;
+                    }
 
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
+                    const auto * t_intra_l = it_l->second;
 
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
+                    const uint32_t n_head = static_cast<uint32_t>(t_intra_o->ne[2]);
+                    const uint32_t n_embd_head_v = static_cast<uint32_t>(t_intra_o->ne[0]);
+                    const uint32_t n_tokens = static_cast<uint32_t>(t_intra_o->ne[1]);
+                    const uint32_t n_stream = static_cast<uint32_t>(t_intra_o->ne[3]);
+
+                    if (h2o_cache.n_head == 0) {
+                        h2o_cache.n_head = n_head;
+                        h2o_cache.n_embd_head_v = n_embd_head_v;
+                        h2o_cache.n_tokens = n_tokens;
+                        h2o_cache.n_stream = n_stream;
+                    } else {
+                        GGML_ASSERT(h2o_cache.n_head == n_head);
+                        GGML_ASSERT(h2o_cache.n_embd_head_v == n_embd_head_v);
+                        GGML_ASSERT(h2o_cache.n_tokens == n_tokens);
+                        GGML_ASSERT(h2o_cache.n_stream == n_stream);
+                    }
+
+                    h2o_cache.intra_o[il].resize(ggml_nelements(t_intra_o));
+                    ggml_backend_tensor_get(t_intra_o, h2o_cache.intra_o[il].data(), 0, h2o_cache.intra_o[il].size() * sizeof(float));
+
+                    h2o_cache.intra_l[il].resize(ggml_nelements(t_intra_l));
+                    ggml_backend_tensor_get(t_intra_l, h2o_cache.intra_l[il].data(), 0, h2o_cache.intra_l[il].size() * sizeof(float));
+                    filled = true;
                 }
 
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
+                h2o_cache.initialized = filled;
+                h2o_cache_ready = filled;
             }
 
-            switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
-                case GGML_STATUS_ALLOC_FAILED: return -2;
-                case GGML_STATUS_FAILED:       return -3;
-                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
-            }
-        }
-
-        if (h2o_enabled && ubatch.n_tokens > 1 && !res->t_h2o_colsum.empty()) {
-            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
-            if (kv != nullptr && cparams.n_ubatch > 0) {
+            if (h2o_enabled && ubatch.n_tokens > 1 && kv != nullptr && cparams.n_ubatch > 0) {
                 struct h2o_colsum_layer {
                     int32_t il = 0;
                     ggml_tensor * tensor = nullptr;
                     std::vector<float> data;
                 };
 
-                std::vector<h2o_colsum_layer> intra_layers;
-                intra_layers.reserve(res->t_h2o_colsum.size());
+                if (phase == 1 && !res->t_h2o_colsum.empty()) {
+                    std::vector<h2o_colsum_layer> intra_layers;
+                    intra_layers.reserve(res->t_h2o_colsum.size());
 
-                std::map<int32_t, h2o_colsum_layer> inter_layers;
+                    for (auto & [il, t_colsum] : res->t_h2o_colsum) {
+                        if (t_colsum == nullptr) {
+                            continue;
+                        }
 
-                for (auto & [il, t_colsum] : res->t_h2o_colsum) {
-                    if (t_colsum == nullptr) {
-                        continue;
+                        h2o_colsum_layer layer;
+                        layer.il = il;
+                        layer.tensor = t_colsum;
+                        layer.data.resize(ggml_nelements(t_colsum));
+                        ggml_backend_tensor_get(t_colsum, layer.data.data(), 0, layer.data.size() * sizeof(float));
+
+                        intra_layers.push_back(std::move(layer));
                     }
 
-                    h2o_colsum_layer layer;
-                    layer.il = il;
-                    layer.tensor = t_colsum;
-                    layer.data.resize(ggml_nelements(t_colsum));
-                    ggml_backend_tensor_get(t_colsum, layer.data.data(), 0, layer.data.size() * sizeof(float));
+                    if (!intra_layers.empty()) {
+                        const uint32_t n_tokens = ubatch.n_tokens;
+                        const uint32_t n_chunks = (n_tokens + h2o_chunk_size - 1) / h2o_chunk_size;
 
-                    intra_layers.push_back(std::move(layer));
-                }
+                        for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+                            const uint32_t chunk_offset = chunk_idx * h2o_chunk_size;
+                            const uint32_t chunk_len = std::min(h2o_chunk_size, n_tokens - chunk_offset);
+                            const uint32_t chunk_start = base_tokens + chunk_offset;
+                            const uint32_t chunk_end = chunk_start + chunk_len;
 
-                for (auto & [il, t_colsum] : res->t_h2o_inter_colsum) {
-                    if (t_colsum == nullptr) {
-                        continue;
-                    }
+                            for (const auto & layer : intra_layers) {
+                                const uint32_t n_kv = static_cast<uint32_t>(layer.tensor->ne[0]);
+                                const uint32_t n_head = static_cast<uint32_t>(layer.tensor->ne[1]);
+                                const uint32_t n_stream = static_cast<uint32_t>(layer.tensor->ne[2]);
 
-                    h2o_colsum_layer layer;
-                    layer.il = il;
-                    layer.tensor = t_colsum;
-                    layer.data.resize(ggml_nelements(t_colsum));
-                    ggml_backend_tensor_get(t_colsum, layer.data.data(), 0, layer.data.size() * sizeof(float));
+                                GGML_ASSERT(n_stream == 1);
+                                GGML_ASSERT(chunk_start + chunk_len <= n_kv);
 
-                    inter_layers.emplace(il, std::move(layer));
-                }
+                                std::vector<float> chunk_colsum(n_head * chunk_len);
+                                for (uint32_t ih = 0; ih < n_head; ++ih) {
+                                    const float * src = layer.data.data() + ih * n_kv + chunk_start;
+                                    float * dst = chunk_colsum.data() + ih * chunk_len;
+                                    std::memcpy(dst, src, chunk_len * sizeof(float));
+                                }
 
-                if (!intra_layers.empty()) {
-                    const uint32_t chunk_size = cparams.n_ubatch;
-                    const uint32_t n_tokens = ubatch.n_tokens;
-                    const uint32_t n_chunks = (n_tokens + chunk_size - 1) / chunk_size;
-                    const uint32_t base_tokens = kv->h2o_get_total_tokens();
+                                kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
 
-                    for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
-                        const uint32_t chunk_offset = chunk_idx * chunk_size;
-                        const uint32_t chunk_len = std::min(chunk_size, n_tokens - chunk_offset);
-                        const uint32_t chunk_start = base_tokens + chunk_offset;
-                        const uint32_t chunk_end = chunk_start + chunk_len;
-
-                        for (const auto & layer : intra_layers) {
-                            const uint32_t n_kv = static_cast<uint32_t>(layer.tensor->ne[0]);
-                            const uint32_t n_head = static_cast<uint32_t>(layer.tensor->ne[1]);
-                            const uint32_t n_stream = static_cast<uint32_t>(layer.tensor->ne[2]);
-
-                            GGML_ASSERT(n_stream == 1);
-                            GGML_ASSERT(chunk_start + chunk_len <= n_kv);
-
-                            std::vector<float> chunk_colsum(n_head * chunk_len);
-                            for (uint32_t ih = 0; ih < n_head; ++ih) {
-                                const float * src = layer.data.data() + ih * n_kv + chunk_start;
-                                float * dst = chunk_colsum.data() + ih * chunk_len;
-                                std::memcpy(dst, src, chunk_len * sizeof(float));
+                                if (chunk_idx == 0) {
+                                    kv->h2o_build_memory_set(layer.il, chunk_end);
+                                }
                             }
+                        }
+                    }
+                } else if (phase == 2) {
+                    std::map<int32_t, h2o_colsum_layer> inter_layers;
 
-                            kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
-
-                            auto it = inter_layers.find(layer.il);
-                            if (it != inter_layers.end()) {
-                                kv->h2o_accumulate_memory_scores(layer.il, it->second.data.data());
-                            }
-
-                            kv->h2o_build_memory_set(layer.il, chunk_end);
+                    for (auto & [il, t_colsum] : res->t_h2o_inter_colsum) {
+                        if (t_colsum == nullptr) {
+                            continue;
                         }
 
-                        kv->h2o_next_chunk(chunk_len);
+                        h2o_colsum_layer layer;
+                        layer.il = il;
+                        layer.tensor = t_colsum;
+                        layer.data.resize(ggml_nelements(t_colsum));
+                        ggml_backend_tensor_get(t_colsum, layer.data.data(), 0, layer.data.size() * sizeof(float));
+
+                        inter_layers.emplace(il, std::move(layer));
                     }
+
+                    const uint32_t chunk_start = base_tokens + h2o_chunk_idx * h2o_chunk_size;
+                    const uint32_t chunk_len = ubatch.n_tokens;
+                    const uint32_t chunk_end = chunk_start + chunk_len;
+
+                    if (h2o_chunk_idx > 0) {
+                        for (auto & [il, layer] : inter_layers) {
+                            kv->h2o_accumulate_memory_scores(il, layer.data.data());
+                            kv->h2o_build_memory_set(il, chunk_end);
+                        }
+                    }
+
+                    kv->h2o_next_chunk(chunk_len);
+                    h2o_chunk_idx++;
                 }
             }
-        }
 
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
+            if (!skip_outputs) {
+                auto * t_logits = res->get_logits();
+                auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
 
-        auto * t_logits = res->get_logits();
-        auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+                if (t_embd && res->get_embd_pooled()) {
+                    t_embd = res->get_embd_pooled();
+                }
 
-        if (t_embd && res->get_embd_pooled()) {
-            t_embd = res->get_embd_pooled();
-        }
+                // extract logits
+                // For multi-sequence batches that mix backend samplers and CPU sampler
+                // this is currently inefficient as we copy all logits even for the
+                // backend sampled tokens.
+                if (logits && t_logits && n_outputs > 0) {
+                    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+                    GGML_ASSERT(backend_res != nullptr);
+                    GGML_ASSERT(logits != nullptr);
 
-        // extract logits
-        // For multi-sequence batches that mix backend samplers and CPU sampler
-        // this is currently inefficient as we copy all logits even for the
-        // backend sampled tokens.
-        if (logits && t_logits && n_outputs > 0) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-            GGML_ASSERT(backend_res != nullptr);
-            GGML_ASSERT(logits != nullptr);
+                    float * logits_out = logits + n_outputs_prev*n_vocab;
 
-            float * logits_out = logits + n_outputs_prev*n_vocab;
-
-            if (n_outputs) {
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits_size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
-            }
-        }
-
-        // extract embeddings
-        if (embd && t_embd && n_outputs > 0) {
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
-            GGML_ASSERT(backend_embd != nullptr);
-
-            switch (cparams.pooling_type) {
-                case LLAMA_POOLING_TYPE_NONE:
-                    {
-                        // extract token embeddings
-                        GGML_ASSERT(embd != nullptr);
-                        const uint32_t n_embd_out = hparams.get_n_embd_out();
-                        float * embd_out = embd + n_outputs_prev*n_embd_out;
-
-                        if (n_outputs) {
-                            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                            GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd_size);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
-                        }
-                    } break;
-                case LLAMA_POOLING_TYPE_MEAN:
-                case LLAMA_POOLING_TYPE_CLS:
-                case LLAMA_POOLING_TYPE_LAST:
-                    {
-                        // extract sequence embeddings (cleared before processing each batch)
-                        auto & embd_seq_out = embd_seq;
-
-                        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-                            const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
-                            const int32_t      seq_idx = ubatch.seq_idx[seq_id];
-
-                            embd_seq_out[seq_id].resize(n_embd);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(float), n_embd*sizeof(float));
-                        }
-                    } break;
-                case LLAMA_POOLING_TYPE_RANK:
-                    {
-                        // extract the rerank score - n_cls_out floats per sequence
-                        auto & embd_seq_out = embd_seq;
-
-                        const uint32_t n_cls_out = hparams.n_cls_out;
-
-                        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-                            const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
-                            const int32_t      seq_idx = ubatch.seq_idx[seq_id];
-
-                            embd_seq_out[seq_id].resize(n_cls_out);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
-                        }
-                    } break;
-                case LLAMA_POOLING_TYPE_UNSPECIFIED:
-                    {
-                        GGML_ABORT("unknown pooling type");
+                    if (n_outputs) {
+                        GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                        GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits_size);
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
                     }
+                }
+
+                // extract embeddings
+                if (embd && t_embd && n_outputs > 0) {
+                    ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+                    GGML_ASSERT(backend_embd != nullptr);
+
+                    switch (cparams.pooling_type) {
+                        case LLAMA_POOLING_TYPE_NONE:
+                            {
+                                // extract token embeddings
+                                GGML_ASSERT(embd != nullptr);
+                                const uint32_t n_embd_out = hparams.get_n_embd_out();
+                                float * embd_out = embd + n_outputs_prev*n_embd_out;
+
+                                if (n_outputs) {
+                                    GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                                    GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd_size);
+                                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                                }
+                            } break;
+                        case LLAMA_POOLING_TYPE_MEAN:
+                        case LLAMA_POOLING_TYPE_CLS:
+                        case LLAMA_POOLING_TYPE_LAST:
+                            {
+                                // extract sequence embeddings (cleared before processing each batch)
+                                auto & embd_seq_out = embd_seq;
+
+                                for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                                    const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
+                                    const int32_t      seq_idx = ubatch.seq_idx[seq_id];
+
+                                    embd_seq_out[seq_id].resize(n_embd);
+                                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(float), n_embd*sizeof(float));
+                                }
+                            } break;
+                        case LLAMA_POOLING_TYPE_RANK:
+                            {
+                                // extract the rerank score - n_cls_out floats per sequence
+                                auto & embd_seq_out = embd_seq;
+
+                                const uint32_t n_cls_out = hparams.n_cls_out;
+
+                                for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                                    const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
+                                    const int32_t      seq_idx = ubatch.seq_idx[seq_id];
+
+                                    embd_seq_out[seq_id].resize(n_cls_out);
+                                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
+                                }
+                            } break;
+                        case LLAMA_POOLING_TYPE_UNSPECIFIED:
+                            {
+                                GGML_ABORT("unknown pooling type");
+                            }
+                    }
+                }
+
+                // This flag indicates whether a backend sampler has actually sampled a specific
+                // token, or if it has produced probabilites. If true, we can skip the normal copying of logits and embeddings.
+                const bool has_sampled = !res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty();
+
+                if (has_samplers && has_sampled) {
+                    const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
+                    const auto stride = n_vocab;
+
+                    // async copy the sampling data from the backend to the host
+                    copy_tensor_async_ints(res->t_sampled, sampling.sampled, sampling.sampled_size, seq_to_output_row, sched.get());
+
+                    copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
+                    copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
+                    copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+                }
+
+                n_outputs_prev += n_outputs;
             }
+        } while (ctx->next());
+
+        return 0;
+    };
+
+    const auto * kv_base = h2o_enabled ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
+    if (h2o_enabled && kv_base == nullptr) {
+        LLAMA_LOG_ERROR("%s: H2O enabled without KV cache\n", __func__);
+        return -2;
+    }
+    const uint32_t base_tokens = kv_base ? kv_base->h2o_get_total_tokens() : 0;
+
+    const int phase1_phase = h2o_prefill ? 1 : 0;
+    const bool skip_phase1_outputs = h2o_two_phase;
+    int run_status = run_phase(mctx, phase1_phase, skip_phase1_outputs, base_tokens);
+    if (run_status != 0) {
+        return run_status;
+    }
+
+    if (h2o_two_phase) {
+        if (!h2o_cache_ready) {
+            LLAMA_LOG_ERROR("%s: H2O phase-1 cache missing, aborting phase-2\n", __func__);
+            return -2;
         }
 
-        // This flag indicates whether a backend sampler has actually sampled a specific
-        // token, or if it has produced probabilites. If true, we can skip the normal copying of logits and embeddings.
-        const bool has_sampled = !res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty();
-
-        if (has_samplers && has_sampled) {
-            const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
-            const auto stride = n_vocab;
-
-            // async copy the sampling data from the backend to the host
-            copy_tensor_async_ints(res->t_sampled, sampling.sampled, sampling.sampled_size, seq_to_output_row, sched.get());
-
-            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
-            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
-            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+        mctx = init_mctx(h2o_chunk_size);
+        if (!mctx) {
+            return init_err;
         }
 
-        n_outputs_prev += n_outputs;
-    } while (mctx->next());
+        run_status = run_phase(mctx, 2, false, base_tokens);
+        if (run_status != 0) {
+            return run_status;
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2153,6 +2255,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.current_phase =*/ current_phase,
+        /*.h2o_prefill   =*/ &h2o_cache,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

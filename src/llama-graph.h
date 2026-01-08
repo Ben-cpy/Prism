@@ -17,6 +17,7 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
+struct h2o_prefill_cache;
 
 struct llama_memory_context_i;
 
@@ -314,6 +315,22 @@ public:
     const llama_kv_cache_context * mctx;
 };
 
+class llm_graph_input_h2o_intra : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_h2o_intra(const h2o_prefill_cache * cache) : cache(cache) {}
+    ~llm_graph_input_h2o_intra() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    std::map<int, ggml_tensor *> intra_o; // [il] -> cached per-head output
+    std::map<int, ggml_tensor *> intra_l; // [il] -> cached sum exp
+
+private:
+    const h2o_prefill_cache * cache;
+};
+
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv_iswa(
@@ -445,6 +462,7 @@ struct llm_graph_params {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     int current_phase = 0; // 0=normal, 1=phase1, 2=phase2
+    const h2o_prefill_cache * h2o_prefill = nullptr;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -581,6 +599,8 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
     std::map<int, ggml_tensor *> t_h2o_colsum;
     std::map<int, ggml_tensor *> t_h2o_inter_colsum;
+    std::map<int, ggml_tensor *> t_h2o_intra_o;
+    std::map<int, ggml_tensor *> t_h2o_intra_l;
 
     // Online softmax state for chunked attention fusion
     struct h2o_online_softmax_state {
@@ -677,6 +697,7 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const int current_phase;
+    const h2o_prefill_cache * h2o_prefill;
 
     const llm_graph_cb & cb_func;
 
@@ -687,6 +708,8 @@ struct llm_graph_context {
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
+
+    llm_graph_input_h2o_intra * build_h2o_intra_inp() const;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
@@ -855,6 +878,10 @@ struct llm_graph_context {
     // Output: colsum [n_kv, n_head, n_stream] (sum over n_tokens dimension)
     ggml_tensor * build_attn_colsum(ggml_tensor * attn_weights, int il) const;
 
+private:
+    mutable llm_graph_input_h2o_intra * h2o_intra_inp = nullptr;
+
+public:
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(
