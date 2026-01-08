@@ -209,6 +209,24 @@ int main(int argc, char ** argv) {
     require(kv.h2o_get_chunk_idx() == 1, "chunk index did not increment");
     require(kv.h2o_get_total_tokens() == chunk_len, "total tokens did not update");
 
+    log_step("reset via clear()");
+    kv.clear(false);
+    require(!kv.h2o_is_memory_initialized(), "memory initialized after clear");
+    require(kv.h2o_get_chunk_idx() == 0, "chunk index not reset after clear");
+    require(kv.h2o_get_total_tokens() == 0, "total tokens not reset after clear");
+
+    kv.h2o_init_chunk_scores(il, 0, chunk_len, attn_colsum.data());
+    kv.h2o_build_memory_set(il, chunk_len);
+
+    log_step("reset via seq_rm()");
+    kv.h2o_next_chunk(chunk_len);
+    require(kv.h2o_get_chunk_idx() == 1, "chunk index did not increment before seq_rm");
+
+    kv.seq_rm(-1, 0, -1);
+    require(!kv.h2o_is_memory_initialized(), "memory initialized after seq_rm");
+    require(kv.h2o_get_chunk_idx() == 0, "chunk index not reset after seq_rm");
+    require(kv.h2o_get_total_tokens() == 0, "total tokens not reset after seq_rm");
+
     log_step("test complete");
     fprintf(stdout, "H2O KV cache checks passed\n");
 

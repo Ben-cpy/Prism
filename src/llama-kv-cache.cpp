@@ -265,7 +265,21 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+void llama_kv_cache::h2o_reset_state() {
+    if (swa_type != LLAMA_SWA_TYPE_H2O) {
+        return;
+    }
+
+    h2o_memory_initialized = false;
+    h2o_state.current_chunk_idx = 0;
+    h2o_state.total_tokens_processed = 0;
+    h2o_state.chunk_boundaries.clear();
+    h2o_state.chunk_boundaries.push_back(0);
+}
+
 void llama_kv_cache::clear(bool data) {
+    h2o_reset_state();
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -337,6 +351,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
         }
     }
+
+    h2o_reset_state();
 
     return true;
 }

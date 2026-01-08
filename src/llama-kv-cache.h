@@ -277,6 +277,7 @@ private:
     } h2o_state;
 
     bool h2o_memory_initialized = false;
+    void h2o_reset_state();
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
