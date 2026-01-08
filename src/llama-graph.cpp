@@ -1739,6 +1739,10 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
 
 ggml_tensor * llm_graph_context::build_attn_colsum(ggml_tensor * attn_weights, int il) const {
     ggml_tensor * permuted = ggml_permute(ctx0, attn_weights, 1, 0, 2, 3);
+    if (permuted->type != GGML_TYPE_F32) {
+        permuted = ggml_cast(ctx0, permuted, GGML_TYPE_F32);
+    }
+    permuted = ggml_cont(ctx0, permuted);
     ggml_tensor * colsum = ggml_sum_rows(ctx0, permuted);
     colsum = ggml_reshape_3d(ctx0, colsum, attn_weights->ne[0], attn_weights->ne[2], attn_weights->ne[3]);
 
