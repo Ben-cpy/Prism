@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -39,6 +40,8 @@ llama_context::llama_context(
 
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
+    cparams.h2o_local_window = params.h2o_local_window;
+    cparams.h2o_heavy_budget = params.h2o_heavy_budget;
     cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -146,6 +149,14 @@ llama_context::llama_context(
     }
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+    if (h2o_enabled) {
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_WARN("%s: H2O enabled - forcing Flash Attention off\n", __func__);
+        }
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.flash_attn = false;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -303,7 +314,7 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = std::min(cparams.n_ctx, h2o_enabled ? cparams.n_batch : cparams.n_ubatch);
 
         const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -627,7 +638,8 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+        const uint32_t n_tokens = std::min(cparams.n_ctx, h2o_enabled ? cparams.n_batch : cparams.n_ubatch);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
         if (!gf) {
@@ -1459,7 +1471,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+        const uint32_t ubatch_size = h2o_enabled ? cparams.n_batch : cparams.n_ubatch;
+        mctx = memory->init_batch(*balloc, ubatch_size, output_all);
         if (!mctx) {
             return -2;
         }
@@ -1559,6 +1573,68 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+        if (h2o_enabled && ubatch.n_tokens > 1 && !res->t_h2o_colsum.empty()) {
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (kv != nullptr && cparams.n_ubatch > 0) {
+                struct h2o_colsum_layer {
+                    int32_t il = 0;
+                    ggml_tensor * tensor = nullptr;
+                    std::vector<float> data;
+                };
+
+                std::vector<h2o_colsum_layer> layers;
+                layers.reserve(res->t_h2o_colsum.size());
+
+                for (auto & [il, t_colsum] : res->t_h2o_colsum) {
+                    if (t_colsum == nullptr) {
+                        continue;
+                    }
+
+                    h2o_colsum_layer layer;
+                    layer.il = il;
+                    layer.tensor = t_colsum;
+                    layer.data.resize(ggml_nelements(t_colsum));
+                    ggml_backend_tensor_get(t_colsum, layer.data.data(), 0, layer.data.size() * sizeof(float));
+
+                    layers.push_back(std::move(layer));
+                }
+
+                if (!layers.empty()) {
+                    const uint32_t chunk_size = cparams.n_ubatch;
+                    const uint32_t n_tokens = ubatch.n_tokens;
+                    const uint32_t n_chunks = (n_tokens + chunk_size - 1) / chunk_size;
+                    const uint32_t base_tokens = kv->h2o_get_total_tokens();
+
+                    for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+                        const uint32_t chunk_offset = chunk_idx * chunk_size;
+                        const uint32_t chunk_len = std::min(chunk_size, n_tokens - chunk_offset);
+                        const uint32_t chunk_start = base_tokens + chunk_offset;
+
+                        for (const auto & layer : layers) {
+                            const uint32_t n_kv = static_cast<uint32_t>(layer.tensor->ne[0]);
+                            const uint32_t n_head = static_cast<uint32_t>(layer.tensor->ne[1]);
+                            const uint32_t n_stream = static_cast<uint32_t>(layer.tensor->ne[2]);
+
+                            GGML_ASSERT(n_stream == 1);
+                            GGML_ASSERT(chunk_start + chunk_len <= n_kv);
+
+                            std::vector<float> chunk_colsum(n_head * chunk_len);
+                            for (uint32_t ih = 0; ih < n_head; ++ih) {
+                                const float * src = layer.data.data() + ih * n_kv + chunk_start;
+                                float * dst = chunk_colsum.data() + ih * chunk_len;
+                                std::memcpy(dst, src, chunk_len * sizeof(float));
+                            }
+
+                            kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
+                        }
+
+                        kv->h2o_next_chunk(chunk_len);
+                    }
+                }
             }
         }
 
@@ -2901,6 +2977,8 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.h2o_local_window            =*/ 256,
+        /*.h2o_heavy_budget            =*/ 256,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
         /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,

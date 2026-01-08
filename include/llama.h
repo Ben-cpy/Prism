@@ -330,6 +330,8 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
+        uint32_t h2o_local_window;  // H2O local window size
+        uint32_t h2o_heavy_budget;  // H2O heavy budget size
 
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id

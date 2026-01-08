@@ -1174,6 +1174,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--h2o-local"}, "N",
+        string_format("H2O local window size (default: %d)", params.h2o_local_window),
+        [](common_params & params, int value) {
+            params.h2o_local_window = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--h2o-heavy"}, "N",
+        string_format("H2O heavy budget size (default: %d)", params.h2o_heavy_budget),
+        [](common_params & params, int value) {
+            params.h2o_heavy_budget = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

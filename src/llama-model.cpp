@@ -7374,6 +7374,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
+                const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+                const llama_swa_type attn_swa_type = h2o_enabled ? LLAMA_SWA_TYPE_H2O : hparams.swa_type;
+
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
@@ -7431,7 +7434,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (!h2o_enabled && hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
                         res = new llama_kv_cache_iswa(
@@ -7449,7 +7452,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 reuse);
                     } else {
-                        GGML_ASSERT(!hparams.is_swa_any());
+                        if (!h2o_enabled) {
+                            GGML_ASSERT(!hparams.is_swa_any());
+                        }
 
                         res = new llama_kv_cache(
                                 *this,
@@ -7462,9 +7467,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_seq_max,
                                 1,
                                 hparams.n_swa,
-                                hparams.swa_type,
+                                attn_swa_type,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                cparams.h2o_local_window,
+                                cparams.h2o_heavy_budget);
                     }
                 }
             }

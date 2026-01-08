@@ -231,6 +231,9 @@ bool llama_hparams::is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama
                     return true;
                 }
             } break;
+        case LLAMA_SWA_TYPE_H2O:
+            {
+            } break;
     }
 
     return false;

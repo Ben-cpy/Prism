@@ -292,6 +292,7 @@ static void print_mask(const float * data, int64_t n_tokens, int64_t n_kv, int64
         case LLAMA_SWA_TYPE_STANDARD:  swa_type_str = "LLAMA_SWA_TYPE_STANDARD"; break;
         case LLAMA_SWA_TYPE_CHUNKED:   swa_type_str = "LLAMA_SWA_TYPE_CHUNKED"; break;
         case LLAMA_SWA_TYPE_SYMMETRIC: swa_type_str = "LLAMA_SWA_TYPE_SYMMETRIC"; break;
+        case LLAMA_SWA_TYPE_H2O:       swa_type_str = "LLAMA_SWA_TYPE_H2O"; break;
     };
 
     LLAMA_LOG_DEBUG("%s: n_swa : %d, n_kv: %d, swq_type: %s\n", __func__, (int)n_swa, (int)n_kv, swa_type_str);
@@ -390,7 +391,50 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    if (!h2o_enabled || !cparams.causal_attn || ubatch->is_pos_2d() || n_tokens == 0) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        return;
+    }
+
+    const uint32_t chunk_size = cparams.n_ubatch;
+    const int64_t n_kv = self_kq_mask->ne[0];
+    const int64_t n_stream = self_kq_mask->ne[3];
+
+    if (chunk_size == 0 || n_tokens <= chunk_size || n_stream != 1) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(self_k_idxs->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+
+    const int64_t * k_idxs = (const int64_t *) self_k_idxs->data;
+    float * data = (float *) self_kq_mask->data;
+
+    std::fill(data, data + ggml_nelements(self_kq_mask), -INFINITY);
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const uint32_t chunk_start = (i / chunk_size) * chunk_size;
+        const llama_pos p1 = ubatch->pos[i];
+
+        for (uint32_t j = chunk_start; j <= i; ++j) {
+            const int64_t kv_idx = k_idxs[j];
+            if (kv_idx < 0 || kv_idx >= n_kv) {
+                continue;
+            }
+
+            float val = 0.0f;
+            if (hparams.use_alibi) {
+                const llama_pos p0 = ubatch->pos[j];
+                val = -std::abs(p0 - p1);
+            }
+
+            data[i * n_kv + kv_idx] = val;
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -583,6 +627,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_h2o_colsum.clear();
 
     params = {};
 
@@ -633,6 +678,11 @@ void llm_graph_result::set_outputs() {
         }
     }
     for (auto & [seq_id, t] : t_candidates) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto & [il, t] : t_h2o_colsum) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -1880,10 +1930,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
+    const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
+    if (!h2o_enabled) {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
@@ -1891,14 +1941,26 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * cur = nullptr;
+    if (h2o_enabled) {
+        ggml_tensor * attn_weights = nullptr;
+        cur = build_attn_h2o(inp, nullptr, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il, &attn_weights);
+        if (attn_weights != nullptr) {
+            ggml_tensor * colsum = build_attn_colsum(attn_weights, il);
+            if (res) {
+                res->t_h2o_colsum[il] = colsum;
+            }
+        }
+    } else {
+        const auto & kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+        ggml_tensor * q = q_cur;
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
-    cb(cur, "kqv_out", il);
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+        cb(cur, "kqv_out", il);
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
