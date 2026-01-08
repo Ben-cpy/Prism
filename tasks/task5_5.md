@@ -1,0 +1,210 @@
+# Task 5.5: Two‑Phase Prefill (Parallel Intra → Sequential Inter) for H2O
+
+## Overview
+
+Implement the **true two‑phase prefill schedule** required by the plan:
+
+1) **Phase 1 (Parallel Intra)**: Use full batch (`-b`) to compute **all chunk intra‑attention in one pass**.  
+2) **Phase 2 (Sequential Inter)**: Use micro‑batch (`-ub`) to process chunks **in order**, each chunk attends to the memory set from the previous chunk, then fuses inter + cached intra via online softmax.
+
+This aligns with the expectation: *“一次性并行算出所有 chunk 的 intra（4 个 chunk），然后顺序逐 chunk 处理 inter/fusion”。*
+
+**Constraints / Design Intent**
+- RoPE uses **absolute positions** (`pos(t) = t`), no chunk‑relative encoding.
+- **Traditional attention** path only (no flash‑attn changes).
+- KV cache written **once** in Phase 1.
+- Phase 2 uses **cached intra results**, not recomputed.
+
+---
+
+## Implementation Steps
+
+### Step 1: Add Two‑Phase Prefill Orchestration
+
+**File**: `/root/workspace/Prism/src/llama-context.cpp`
+
+Add explicit two‑pass logic inside `llama_decode_internal` when:
+`h2o_enabled && prefill (ubatch.n_tokens > 1)`.
+
+Pseudo‑flow:
+```
+Phase 1:
+  ubatch_size = n_batch
+  current_phase = 1
+  process_ubatch(full prompt)
+  extract intra stats (o_intra / l_intra) + intra colsum
+  init scores for each chunk
+  build memory set for chunk0 only
+
+Phase 2:
+  ubatch_size = n_ubatch
+  current_phase = 2
+  for each chunk (sequential):
+     process_ubatch(chunk)
+     accumulate memory scores from inter colsum
+     build memory set for chunk c
+```
+
+**Verification**:
+- `Phase 1` executes exactly **one** ubatch when `n_tokens <= n_batch`.
+- `Phase 2` executes `ceil(n_tokens / n_ubatch)` ubatches.
+
+---
+
+### Step 2: Add Phase‑1 Intra Cache (Host Buffers)
+
+**Goal**: Cache intra results once, avoid recomputation in Phase 2.
+
+**File**: `/root/workspace/Prism/src/llama-context.h`
+
+Add a new cache container (host‑side, per layer):
+```cpp
+struct h2o_prefill_cache {
+    // per layer:
+    std::vector<std::vector<float>> intra_o; // [il] -> [n_embd_head_v * n_tokens * n_head]
+    std::vector<std::vector<float>> intra_l; // [il] -> [n_tokens * n_head]
+    uint32_t n_tokens = 0;
+    uint32_t n_head = 0;
+    uint32_t n_embd_head_v = 0;
+    bool initialized = false;
+};
+```
+
+**Notes**:
+- Store **online softmax state** (o, l) instead of full logits to avoid O(N²) memory.
+- Shapes match per‑head outputs: `o_intra` in per‑head layout `[d_head, n_tokens, n_head]`.
+
+---
+
+### Step 3: Phase‑1 Graph Outputs (Intra Only)
+
+**Files**:  
+`/root/workspace/Prism/src/llama-graph.h`  
+`/root/workspace/Prism/src/llama-graph.cpp`
+
+In `current_phase == 1`:
+- Use `build_attn_h2o` to compute **intra** only (no inter).
+- Compute and **export**:
+  - `o_intra = softmax(logits_intra) @ V_intra`
+  - `l_intra = sum(exp(logits_intra))`
+
+These become graph outputs so Phase‑1 results can be copied to host:
+```cpp
+res->t_h2o_intra_o[il] = o_intra;
+res->t_h2o_intra_l[il] = l_intra;
+```
+
+**Verification**:
+- `ggml_set_output` called on these tensors.
+- Host copies fill `h2o_prefill_cache`.
+
+---
+
+### Step 4: Phase‑2 Graph Inputs (Use Cached Intra)
+
+**Files**:  
+`/root/workspace/Prism/src/llama-graph.h`  
+`/root/workspace/Prism/src/llama-graph.cpp`
+
+In `current_phase == 2`:
+- Create **input tensors** from `h2o_prefill_cache`:
+  - `intra_o_input`
+  - `intra_l_input`
+- Slice to current chunk (`[chunk_start, chunk_end)`) using `ggml_view_*`.
+- Compute inter attention to memory set:
+  - `o_inter`, `l_inter`
+- Fuse:
+```
+o_total = o_inter + o_intra
+l_total = l_inter + l_intra
+out = o_total / l_total
+```
+
+---
+
+### Step 5: Avoid Double KV Writes
+
+**Files**:  
+`/root/workspace/Prism/src/llama-graph.cpp`
+
+Add a **skip‑store** path for Phase‑2:
+- Phase 1 writes K/V to KV cache.
+- Phase 2 must **not** call `cpy_k/cpy_v` again.
+
+Option A:
+```cpp
+if (current_phase == 2) { skip cpy_k/cpy_v; }
+```
+Option B:
+Introduce a new helper `build_attn_h2o_no_store(...)`.
+
+---
+
+### Step 6: Score Update & Memory Set Timing
+
+**File**: `/root/workspace/Prism/src/llama-context.cpp`
+
+**Phase 1**:
+- Initialize scores for **all chunks** from intra colsum.
+- Build memory set **only for chunk 0**.
+
+**Phase 2**:
+- After inter attention for chunk c:
+  - `h2o_accumulate_memory_scores` on `M_{c-1}`
+  - `h2o_build_memory_set` for chunk c
+
+This matches the plan’s scoring rules.
+
+---
+
+### Step 7: Graph Reuse Safety
+
+**Files**:
+`/root/workspace/Prism/src/llama-graph.h`  
+`/root/workspace/Prism/src/llama-context.cpp`
+
+Ensure `current_phase` is part of `llm_graph_params::allow_reuse` so:
+- Phase‑1 graph won’t be reused for Phase‑2 (or vice versa).
+
+---
+
+## Verification Checklist
+
+### Correctness
+- [ ] Phase‑1 runs once at `-b` and computes intra for all chunks.
+- [ ] Phase‑2 runs `ceil(N / -ub)` ubatches sequentially.
+- [ ] Chunk 0 uses only intra (no inter).
+- [ ] Chunks 1..k use inter + cached intra fusion.
+- [ ] Scores update: init from intra, accumulate from inter only.
+
+### Performance
+- [ ] Phase‑1 saturates GPU (parallel intra).
+- [ ] Phase‑2 time scales with `k-1` chunks, not N².
+
+### Robustness
+- [ ] `N <= S` works (only phase‑1).
+- [ ] `N == 2S-1` and `N == kS` work.
+
+---
+
+## Build & Test
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build build -j12
+
+LLAMACPP_TEST_MODELFILE=/models/Qwen_Qwen3-1.7B-Q8_0.gguf \
+./build/bin/llama-cli -m /models/Qwen_Qwen3-1.7B-Q8_0.gguf \
+  -p "Hello world from H2O! " -n 0 \
+  -b 4096 -ub 1024 --h2o-local 256 --h2o-heavy 256 -st
+```
+
+---
+
+## Success Criteria
+
+- ✅ Phase‑1 computes all chunk intra **in one pass**
+- ✅ Phase‑2 sequential inter + fusion uses cached intra
+- ✅ Memory sets update correctly across chunks
+- ✅ No double KV writes
+- ✅ End‑to‑end prefill runs without crashes
