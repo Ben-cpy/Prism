@@ -23,6 +23,11 @@ enum llama_swa_type {
     LLAMA_SWA_TYPE_H2O       = 4,
 };
 
+enum llama_attn_head_type : uint8_t {
+    LLAMA_ATTN_HEAD_GQA = 0,
+    LLAMA_ATTN_HEAD_MHA = 1,
+};
+
 struct llama_hparams_posnet {
     uint32_t n_embd;
     uint32_t n_layer;
@@ -65,6 +70,7 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
+    std::array<uint8_t,  LLAMA_MAX_LAYERS> attn_head_type_arr;
 
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
@@ -234,6 +240,13 @@ struct llama_hparams {
     uint32_t n_ff(uint32_t il = 0) const;
 
     uint32_t n_gqa(uint32_t il = 0) const;
+
+    llama_attn_head_type attn_head_type(uint32_t il) const;
+    bool is_gqa(uint32_t il) const { return attn_head_type(il) == LLAMA_ATTN_HEAD_GQA; }
+    uint32_t n_head_mem(uint32_t il) const {
+        const uint32_t n_kv = n_head_kv(il);
+        return n_kv > 0 ? n_kv : n_head(il);
+    }
 
     // dimension of main + auxiliary input embeddings
     uint32_t n_embd_inp() const;

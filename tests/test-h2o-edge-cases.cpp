@@ -94,6 +94,20 @@ struct logits_block {
     int32_t n_vocab = 0;
 };
 
+void dump_mem_idx(const ggml_tensor * mem_idx, uint32_t head, uint32_t M, const char * label) {
+    if (!mem_idx) {
+        fprintf(stderr, "%s: mem_idx missing\n", label);
+        return;
+    }
+    const uint8_t * base = static_cast<const uint8_t *>(mem_idx->data);
+    const int32_t * head_data = reinterpret_cast<const int32_t *>(base + head * mem_idx->nb[1]);
+    fprintf(stderr, "%s head %u: [", label, head);
+    for (uint32_t m = 0; m < M; ++m) {
+        fprintf(stderr, "%d%s", head_data[m], (m + 1 < M) ? ", " : "");
+    }
+    fprintf(stderr, "]\n");
+}
+
 logits_block decode_and_get_logits(llama_context * ctx, const std::vector<llama_token> & tokens,
         llama_pos base_pos, bool all_logits, int32_t n_vocab, const char * label) {
     llama_batch batch = make_batch(tokens, base_pos, all_logits);
@@ -149,10 +163,13 @@ std::vector<llama_token> make_tokens(uint32_t n_tokens, llama_token base) {
 
 void test_cross_batch_continuity(llama_model_ptr & model, int32_t n_vocab) {
     fprintf(stderr, "\n=== Test 1: Cross-Batch Continuity ===\n");
-    fprintf(stderr, "Scaled down example: -b=8, -ub=4 (8 tokens => 2 chunks)\n");
+    fprintf(stderr, "Scaled down example: -b=16, -ub=4 (16 tokens => 4 chunks; split into 8+8)\n");
+    const llama_hparams & hparams = model->hparams;
+    const int32_t il = find_first_kv_layer(hparams);
+    require(il >= 0, "no KV layers found");
 
     const uint32_t chunk_size = 4;
-    const uint32_t n_tokens_total = 8;
+    const uint32_t n_tokens_total = 16;
     const uint32_t n_ctx = 128;
     const uint32_t h2o_local = 2;
     const uint32_t h2o_heavy = 2;
@@ -166,28 +183,42 @@ void test_cross_batch_continuity(llama_model_ptr & model, int32_t n_vocab) {
     require(full_ctx.kv != nullptr, "kv cache missing in full batch context");
     require(full_ctx.kv->h2o_is_memory_initialized(), "H2O memory not initialized after full batch");
     require(full_ctx.kv->h2o_get_total_tokens() == n_tokens_total, "total tokens mismatch after full batch");
-    require(full_ctx.kv->h2o_get_chunk_idx() == 2, "chunk index mismatch after full batch");
+    require(full_ctx.kv->h2o_get_chunk_idx() == 4, "chunk index mismatch after full batch");
+    const ggml_tensor * mem_idx = full_ctx.kv->h2o_get_memory_indices_tensor(il);
+    require(mem_idx != nullptr, "memory indices tensor missing");
+    require(mem_idx->ne[1] == static_cast<int64_t>(hparams.n_head_kv(il)), "memory head count mismatch");
+    if (std::getenv("H2O_DEBUG_MEMIDX")) {
+        dump_mem_idx(mem_idx, 0, full_ctx.kv->h2o_get_memory_size(), "full mem_idx");
+    }
 
     auto split_ctx = make_h2o_context(model, n_ctx, n_tokens_total, chunk_size, h2o_local, h2o_heavy, true);
 
-    std::vector<llama_token> tokens1(tokens.begin(), tokens.begin() + 4);
-    std::vector<llama_token> tokens2(tokens.begin() + 4, tokens.end());
+    std::vector<llama_token> tokens1(tokens.begin(), tokens.begin() + 8);
+    std::vector<llama_token> tokens2(tokens.begin() + 8, tokens.end());
 
     decode_and_get_logits(split_ctx.ctx.get(), tokens1, 0, true, n_vocab, "batch1 decode failed");
     require(split_ctx.kv != nullptr, "kv cache missing in split batch context");
     require(split_ctx.kv->h2o_is_memory_initialized(), "H2O memory not initialized after batch1");
-    require(split_ctx.kv->h2o_get_total_tokens() == 4, "total tokens mismatch after batch1");
-    require(split_ctx.kv->h2o_get_chunk_idx() == 1, "chunk index mismatch after batch1");
+    require(split_ctx.kv->h2o_get_total_tokens() == 8, "total tokens mismatch after batch1");
+    require(split_ctx.kv->h2o_get_chunk_idx() == 2, "chunk index mismatch after batch1");
+    if (std::getenv("H2O_DEBUG_MEMIDX")) {
+        const ggml_tensor * mem_idx_split = split_ctx.kv->h2o_get_memory_indices_tensor(il);
+        dump_mem_idx(mem_idx_split, 0, split_ctx.kv->h2o_get_memory_size(), "split mem_idx after batch1");
+    }
 
     logits_block split_logits = decode_and_get_logits(
-            split_ctx.ctx.get(), tokens2, 4, true, n_vocab, "batch2 decode failed");
+            split_ctx.ctx.get(), tokens2, 8, true, n_vocab, "batch2 decode failed");
 
     require(split_ctx.kv->h2o_get_total_tokens() == n_tokens_total, "total tokens mismatch after batch2");
-    require(split_ctx.kv->h2o_get_chunk_idx() == 2, "chunk index mismatch after batch2");
+    require(split_ctx.kv->h2o_get_chunk_idx() == 4, "chunk index mismatch after batch2");
+    if (std::getenv("H2O_DEBUG_MEMIDX")) {
+        const ggml_tensor * mem_idx_split = split_ctx.kv->h2o_get_memory_indices_tensor(il);
+        dump_mem_idx(mem_idx_split, 0, split_ctx.kv->h2o_get_memory_size(), "split mem_idx after batch2");
+    }
 
     const float tol = 1e-4f;
-    for (int32_t i = 0; i < 4; ++i) {
-        compare_logits_token(full_logits, 4 + i, split_logits, i, tol,
+    for (int32_t i = 0; i < 8; ++i) {
+        compare_logits_token(full_logits, 8 + i, split_logits, i, tol,
                 "cross-batch logits mismatch");
     }
 
@@ -196,7 +227,7 @@ void test_cross_batch_continuity(llama_model_ptr & model, int32_t n_vocab) {
 
 void test_short_sequence(llama_model_ptr & model, int32_t n_vocab) {
     fprintf(stderr, "\n=== Test 2: Short Sequence (< chunk_size) ===\n");
-    fprintf(stderr, "Scaled down example: -b=4, -ub=8 (4 tokens => single chunk)\n");
+    fprintf(stderr, "Scaled down example: -b=8, -ub=8 (4 tokens => single chunk)\n");
 
     const uint32_t chunk_size = 8;
     const uint32_t n_tokens = 4;
@@ -204,8 +235,8 @@ void test_short_sequence(llama_model_ptr & model, int32_t n_vocab) {
     const uint32_t h2o_local = 4;
     const uint32_t h2o_heavy = 4;
 
-    auto h2o_ctx = make_h2o_context(model, n_ctx, n_tokens, chunk_size, h2o_local, h2o_heavy, true);
-    auto base_ctx = make_h2o_context(model, n_ctx, n_tokens, chunk_size, 0, 0, false);
+    auto h2o_ctx = make_h2o_context(model, n_ctx, chunk_size, chunk_size, h2o_local, h2o_heavy, true);
+    auto base_ctx = make_h2o_context(model, n_ctx, chunk_size, chunk_size, 0, 0, false);
 
     auto tokens = make_tokens(n_tokens, 200);
 

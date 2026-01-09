@@ -1384,6 +1384,35 @@ static void copy_tensor_async_candidates(
     }
 }
 
+static void h2o_reduce_colsum_to_kv_heads(
+        const float * src,
+        uint32_t n_cols,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        float * dst) {
+    if (n_head_kv == n_head) {
+        std::memcpy(dst, src, static_cast<size_t>(n_head) * n_cols * sizeof(float));
+        return;
+    }
+
+    GGML_ASSERT(n_head_kv > 0);
+    GGML_ASSERT(n_head % n_head_kv == 0);
+
+    const uint32_t n_gqa = n_head / n_head_kv;
+    std::memset(dst, 0, static_cast<size_t>(n_head_kv) * n_cols * sizeof(float));
+
+    for (uint32_t kv = 0; kv < n_head_kv; ++kv) {
+        float * dst_head = dst + kv * n_cols;
+        for (uint32_t g = 0; g < n_gqa; ++g) {
+            const uint32_t qh = kv * n_gqa + g;
+            const float * src_head = src + qh * n_cols;
+            for (uint32_t c = 0; c < n_cols; ++c) {
+                dst_head[c] += src_head[c];
+            }
+        }
+    }
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
@@ -1702,20 +1731,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                 const uint32_t n_kv = static_cast<uint32_t>(layer.tensor->ne[0]);
                                 const uint32_t n_head = static_cast<uint32_t>(layer.tensor->ne[1]);
                                 const uint32_t n_stream = static_cast<uint32_t>(layer.tensor->ne[2]);
+                                const uint32_t n_head_mem = hparams.n_head_mem(layer.il);
 
                                 GGML_ASSERT(n_stream == 1);
                                 GGML_ASSERT(chunk_start + chunk_len <= n_kv);
 
-                                std::vector<float> chunk_colsum(n_head * chunk_len);
+                                std::vector<float> chunk_src(n_head * chunk_len);
                                 for (uint32_t ih = 0; ih < n_head; ++ih) {
                                     const float * src = layer.data.data() + ih * n_kv + chunk_start;
-                                    float * dst = chunk_colsum.data() + ih * chunk_len;
+                                    float * dst = chunk_src.data() + ih * chunk_len;
                                     std::memcpy(dst, src, chunk_len * sizeof(float));
                                 }
 
+                                std::vector<float> chunk_colsum(n_head_mem * chunk_len);
+                                h2o_reduce_colsum_to_kv_heads(
+                                    chunk_src.data(), chunk_len, n_head, n_head_mem, chunk_colsum.data());
                                 kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
 
-                                if (chunk_idx == 0) {
+                                if (chunk_idx == 0 && !kv->h2o_is_memory_initialized()) {
                                     kv->h2o_build_memory_set(layer.il, chunk_end);
                                 }
                             }
@@ -1742,9 +1775,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     const uint32_t chunk_len = ubatch.n_tokens;
                     const uint32_t chunk_end = chunk_start + chunk_len;
 
-                    if (h2o_chunk_idx > 0) {
+                    const bool has_prev_chunks = base_tokens > 0 || h2o_chunk_idx > 0;
+                    if (has_prev_chunks) {
                         for (auto & [il, layer] : inter_layers) {
-                            kv->h2o_accumulate_memory_scores(il, layer.data.data());
+                            const uint32_t n_cols = static_cast<uint32_t>(layer.tensor->ne[0]);
+                            const uint32_t n_head = static_cast<uint32_t>(layer.tensor->ne[1]);
+                            const uint32_t n_stream = static_cast<uint32_t>(layer.tensor->ne[2]);
+                            const uint32_t n_head_mem = hparams.n_head_mem(il);
+
+                            GGML_ASSERT(n_stream == 1);
+
+                            std::vector<float> inter_kv(n_head_mem * n_cols);
+                            h2o_reduce_colsum_to_kv_heads(
+                                layer.data.data(), n_cols, n_head, n_head_mem, inter_kv.data());
+                            kv->h2o_accumulate_memory_scores(il, inter_kv.data());
                             kv->h2o_build_memory_set(il, chunk_end);
                         }
                     }

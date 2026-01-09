@@ -306,6 +306,8 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
+    bool h2o_use_inter = false;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -327,6 +329,7 @@ public:
     std::map<int, ggml_tensor *> intra_o; // [il] -> cached per-head output
     std::map<int, ggml_tensor *> intra_l; // [il] -> cached sum exp
     std::map<int, ggml_tensor *> intra_m; // [il] -> cached max logits
+    llama_pos ubatch_pos0 = -1;
 
 private:
     const h2o_prefill_cache * cache;

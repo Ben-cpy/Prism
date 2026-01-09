@@ -13,6 +13,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <unordered_set>
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -451,6 +453,14 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_kq_mask->ne[0] == mctx->get_n_kv();
     res &= self_kq_mask->ne[1] == params.ubatch.n_tokens;
 
+    const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+    if (h2o_enabled && params.current_phase == 2) {
+        const bool use_inter_new = params.ubatch.pos && params.ubatch.pos[0] > 0 && mctx->h2o_is_memory_initialized();
+        if (use_inter_new != h2o_use_inter) {
+            return false;
+        }
+    }
+
     return res;
 }
 
@@ -497,6 +507,11 @@ bool llm_graph_input_h2o_intra::can_reuse(const llm_graph_params & params) {
     }
 
     cache = cache_params;
+
+    const llama_pos pos0 = params.ubatch.pos ? params.ubatch.pos[0] : -1;
+    if (pos0 != ubatch_pos0) {
+        return false;
+    }
 
     for (const auto & [il, tensor] : intra_o) {
         if (il < 0 || static_cast<size_t>(il) >= cache_params->intra_o.size()) {
@@ -1899,6 +1914,11 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
 
     bool did_fuse = false;
     if (current_phase == 2) {
+        // Ensure phase-2 graph allocates H2O input buffers even when they are not directly used.
+        ggml_build_forward_expand(gf, inp->get_k_idxs());
+        ggml_build_forward_expand(gf, inp->get_v_idxs());
+        ggml_build_forward_expand(gf, inp->get_kq_mask());
+
         GGML_ASSERT(h2o_prefill && h2o_prefill->initialized);
         GGML_ASSERT(ubatch.pos != nullptr);
         const int64_t token_offset = static_cast<int64_t>(ubatch.pos[0]) - static_cast<int64_t>(h2o_prefill->base_pos);
@@ -1951,6 +1971,11 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
             intra_m_full = it_m->second;
         }
 
+        // Ensure phase-2 intra cache inputs are allocated even when only viewed.
+        ggml_build_forward_expand(gf, intra_o_full);
+        ggml_build_forward_expand(gf, intra_l_full);
+        ggml_build_forward_expand(gf, intra_m_full);
+
         ggml_tensor * intra_o = ggml_view_4d(ctx0, intra_o_full,
                 intra_o_full->ne[0], ubatch.n_tokens, intra_o_full->ne[2], intra_o_full->ne[3],
                 intra_o_full->nb[1], intra_o_full->nb[2], intra_o_full->nb[3],
@@ -1970,6 +1995,11 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
         // Use absolute position instead of batch-relative offset
         // This correctly handles cross-batch scenarios where batch2 chunk0 needs batch1 memory
         const bool use_inter = ubatch.pos[0] > 0 && mctx_kv->h2o_is_memory_initialized();
+        if (std::getenv("H2O_DEBUG_USE_INTER") && il == 0) {
+            const long long pos0 = ubatch.pos ? (long long) ubatch.pos[0] : -1;
+            fprintf(stderr, "[H2O] phase=%d ubatch.pos[0]=%lld use_inter=%d\n",
+                    current_phase, pos0, use_inter ? 1 : 0);
+        }
 
         ggml_tensor * fused = nullptr;
         if (use_inter) {
@@ -1995,12 +2025,18 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
                 intra_o_cast = ggml_cast(ctx0, intra_o_cast, state.o->type);
             }
 
-            ggml_tensor * intra_l4 = ggml_reshape_4d(ctx0, intra_l, 1, intra_l->ne[0], intra_l->ne[1], intra_l->ne[2]);
+            ggml_tensor * intra_l4 = ggml_view_4d(ctx0, intra_l,
+                    1, intra_l->ne[0], intra_l->ne[1], intra_l->ne[2],
+                    intra_l->nb[0], intra_l->nb[1], intra_l->nb[2],
+                    0);
             if (state.l && intra_l4->type != state.l->type) {
                 intra_l4 = ggml_cast(ctx0, intra_l4, state.l->type);
             }
 
-            ggml_tensor * intra_m4 = ggml_reshape_4d(ctx0, intra_m, 1, intra_m->ne[0], intra_m->ne[1], intra_m->ne[2]);
+            ggml_tensor * intra_m4 = ggml_view_4d(ctx0, intra_m,
+                    1, intra_m->ne[0], intra_m->ne[1], intra_m->ne[2],
+                    intra_m->nb[0], intra_m->nb[1], intra_m->nb[2],
+                    0);
             if (state.m && intra_m4->type != state.m->type) {
                 intra_m4 = ggml_cast(ctx0, intra_m4, state.m->type);
             }
@@ -2192,6 +2228,14 @@ ggml_tensor * llm_graph_context::build_attn_inter_h2o(
     ggml_tensor * k = ggml_permute(ctx0, k_mem, 0, 2, 1, 3);
     ggml_tensor * v = ggml_permute(ctx0, v_mem, 0, 2, 1, 3);
 
+    if (std::getenv("LLAMA_H2O_DEBUG_SHAPES")) {
+        fprintf(stderr,
+                "[H2O] q ne=[%lld,%lld,%lld,%lld] k_mem ne=[%lld,%lld,%lld,%lld] k ne=[%lld,%lld,%lld,%lld]\n",
+                (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                (long long) k_mem->ne[0], (long long) k_mem->ne[1], (long long) k_mem->ne[2], (long long) k_mem->ne[3],
+                (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3]);
+    }
+
     ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
     cb(kq, "kq_inter_h2o", il);
 
@@ -2227,6 +2271,18 @@ ggml_tensor * llm_graph_context::build_attn_inter_h2o(
     if (!v_trans) {
         v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
         cb(v, "v_cont_inter_h2o", il);
+    }
+    if (ggml_is_transposed(v)) {
+        v = ggml_cont(ctx0, v);
+        cb(v, "v_cont_inter_h2o", il);
+    }
+
+    if (std::getenv("LLAMA_H2O_DEBUG_SHAPES")) {
+        fprintf(stderr,
+                "[H2O] v ne=[%lld,%lld,%lld,%lld] kq ne=[%lld,%lld,%lld,%lld] v_trans=%d\n",
+                (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
+                (long long) kq->ne[0], (long long) kq->ne[1], (long long) kq->ne[2], (long long) kq->ne[3],
+                v_trans ? 1 : 0);
     }
 
     ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
@@ -2466,6 +2522,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
     }
 
+    const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+    if (h2o_enabled && ubatch.pos) {
+        inp->h2o_use_inter = ubatch.pos[0] > 0 && mctx_cur->h2o_is_memory_initialized();
+    }
+
     return inp;
 }
 
@@ -2483,6 +2544,7 @@ llm_graph_input_h2o_intra * llm_graph_context::build_h2o_intra_inp() const {
     }
 
     auto inp = std::make_unique<llm_graph_input_h2o_intra>(h2o_prefill);
+    inp->ubatch_pos0 = ubatch.pos ? ubatch.pos[0] : -1;
     h2o_intra_inp = (llm_graph_input_h2o_intra *) res->add_input(std::move(inp));
     return h2o_intra_inp;
 }

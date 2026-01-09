@@ -161,12 +161,13 @@ int main(int argc, char ** argv) {
     inp1.self_kq_mask_cnv = inp1.self_kq_mask;
 
     const int64_t n_head = hparams.n_head(il);
+    const int64_t n_head_kv = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k;
     const int64_t n_embd_head_v = hparams.n_embd_head_v;
 
     ggml_tensor * q1 = ggml_new_tensor_3d(graph1.ctx0, GGML_TYPE_F32, n_embd_head_k, n_head, n_tokens);
-    ggml_tensor * k1 = ggml_new_tensor_3d(graph1.ctx0, GGML_TYPE_F32, n_embd_head_k, n_head, n_tokens);
-    ggml_tensor * v1 = ggml_new_tensor_3d(graph1.ctx0, GGML_TYPE_F32, n_embd_head_v, n_head, n_tokens);
+    ggml_tensor * k1 = ggml_new_tensor_3d(graph1.ctx0, GGML_TYPE_F32, n_embd_head_k, n_head_kv, n_tokens);
+    ggml_tensor * v1 = ggml_new_tensor_3d(graph1.ctx0, GGML_TYPE_F32, n_embd_head_v, n_head_kv, n_tokens);
 
     ggml_set_input(q1);
     ggml_set_input(k1);
@@ -244,7 +245,8 @@ int main(int argc, char ** argv) {
 
     cache.initialized = true;
 
-    std::vector<float> dummy_scores(cache.n_head * chunk_size, 0.0f);
+    const uint32_t n_head_mem = hparams.n_head_mem(il);
+    std::vector<float> dummy_scores(n_head_mem * chunk_size, 0.0f);
     kv.h2o_init_chunk_scores(il, 0, chunk_size, dummy_scores.data());
     kv.h2o_build_memory_set(il, chunk_size);
 
@@ -274,8 +276,8 @@ int main(int argc, char ** argv) {
     inp2.self_kq_mask_cnv = inp2.self_kq_mask;
 
     ggml_tensor * q2 = ggml_new_tensor_3d(graph2.ctx0, GGML_TYPE_F32, n_embd_head_k, n_head, chunk_size);
-    ggml_tensor * k2 = ggml_new_tensor_3d(graph2.ctx0, GGML_TYPE_F32, n_embd_head_k, n_head, chunk_size);
-    ggml_tensor * v2 = ggml_new_tensor_3d(graph2.ctx0, GGML_TYPE_F32, n_embd_head_v, n_head, chunk_size);
+    ggml_tensor * k2 = ggml_new_tensor_3d(graph2.ctx0, GGML_TYPE_F32, n_embd_head_k, n_head_kv, chunk_size);
+    ggml_tensor * v2 = ggml_new_tensor_3d(graph2.ctx0, GGML_TYPE_F32, n_embd_head_v, n_head_kv, chunk_size);
 
     ggml_set_input(q2);
     ggml_set_input(k2);
@@ -286,12 +288,13 @@ int main(int argc, char ** argv) {
     ggml_backend_buffer_t buf2 = ggml_backend_alloc_ctx_tensors(graph2.ctx0, backend);
     require(buf2 != nullptr, "failed to allocate phase2 buffer");
 
-    const size_t qkv_chunk_elems_k = static_cast<size_t>(n_embd_head_k * n_head * chunk_size);
-    const size_t qkv_chunk_elems_v = static_cast<size_t>(n_embd_head_v * n_head * chunk_size);
+    const size_t q_chunk_elems = static_cast<size_t>(n_embd_head_k * n_head * chunk_size);
+    const size_t k_chunk_elems = static_cast<size_t>(n_embd_head_k * n_head_kv * chunk_size);
+    const size_t v_chunk_elems = static_cast<size_t>(n_embd_head_v * n_head_kv * chunk_size);
 
-    std::vector<float> q2_data(q1_data.begin(), q1_data.begin() + qkv_chunk_elems_k);
-    std::vector<float> k2_data(k1_data.begin(), k1_data.begin() + qkv_chunk_elems_k);
-    std::vector<float> v2_data(v1_data.begin(), v1_data.begin() + qkv_chunk_elems_v);
+    std::vector<float> q2_data(q1_data.begin(), q1_data.begin() + q_chunk_elems);
+    std::vector<float> k2_data(k1_data.begin(), k1_data.begin() + k_chunk_elems);
+    std::vector<float> v2_data(v1_data.begin(), v1_data.begin() + v_chunk_elems);
 
     fill_tensor(q2, q2_data);
     fill_tensor(k2, k2_data);

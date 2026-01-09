@@ -563,6 +563,15 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer, false);
 
+    std::fill(hparams.attn_head_type_arr.begin(), hparams.attn_head_type_arr.end(), LLAMA_ATTN_HEAD_GQA);
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        const uint32_t n_head = hparams.n_head_arr[il];
+        const uint32_t n_head_kv = hparams.n_head_kv_arr[il];
+        if (n_head_kv > 0 && n_head_kv == n_head) {
+            hparams.attn_head_type_arr[il] = LLAMA_ATTN_HEAD_MHA;
+        }
+    }
+
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;

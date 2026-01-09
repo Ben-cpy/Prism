@@ -239,7 +239,7 @@ void run_score_init_test(llama_model & model, int32_t il) {
     const ggml_tensor * scores = kv.h2o_get_scores_tensor(il);
     require(scores != nullptr, "scores tensor missing");
 
-    const uint32_t n_head = model.hparams.n_head(il);
+    const uint32_t n_head = model.hparams.n_head_mem(il);
     std::vector<float> attn_colsum(n_head * chunk_len);
     for (uint32_t ih = 0; ih < n_head; ++ih) {
         for (uint32_t pos = 0; pos < chunk_len; ++pos) {

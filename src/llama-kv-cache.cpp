@@ -222,13 +222,13 @@ llama_kv_cache::llama_kv_cache(
 
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
-            const uint32_t n_head = hparams.n_head(il);
+            const uint32_t n_head_mem = hparams.n_head_mem(il);
 
-            ggml_tensor * scores = ggml_new_tensor_2d(ctx_h2o, GGML_TYPE_BF16, kv_size, n_head);
+            ggml_tensor * scores = ggml_new_tensor_2d(ctx_h2o, GGML_TYPE_BF16, kv_size, n_head_mem);
             ggml_format_name(scores, "h2o_scores_l%d", il);
             h2o_scores.push_back(scores);
 
-            ggml_tensor * mem_idx = ggml_new_tensor_2d(ctx_h2o, GGML_TYPE_I32, h2o_memory_size, n_head);
+            ggml_tensor * mem_idx = ggml_new_tensor_2d(ctx_h2o, GGML_TYPE_I32, h2o_memory_size, n_head_mem);
             ggml_format_name(mem_idx, "h2o_mem_idx_l%d", il);
             h2o_memory_indices.push_back(mem_idx);
         }
@@ -1087,7 +1087,7 @@ void llama_kv_cache::h2o_init_chunk_scores(
     const int32_t il_cache = map_layer_ids[il];
     ggml_tensor * scores = h2o_scores[il_cache];
     GGML_ASSERT(chunk_start + chunk_len <= static_cast<uint32_t>(scores->ne[0]));
-    const uint32_t n_head = hparams.n_head(il);
+    const uint32_t n_head = hparams.n_head_mem(il);
 
     ggml_bf16_t * score_data = static_cast<ggml_bf16_t *>(scores->data);
 
@@ -1111,7 +1111,7 @@ void llama_kv_cache::h2o_accumulate_memory_scores(
     ggml_tensor * scores = h2o_scores[il_cache];
     ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
 
-    const uint32_t n_head = hparams.n_head(il);
+    const uint32_t n_head = hparams.n_head_mem(il);
     const uint32_t M = h2o_memory_size;
 
     ggml_bf16_t * score_data = static_cast<ggml_bf16_t *>(scores->data);
@@ -1139,7 +1139,7 @@ void llama_kv_cache::h2o_build_memory_set(int32_t il, uint32_t chunk_end) {
     ggml_tensor * scores = h2o_scores[il_cache];
     ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
 
-    const uint32_t n_head = hparams.n_head(il);
+    const uint32_t n_head = hparams.n_head_mem(il);
     const uint32_t L = h2o_local_window;
     const uint32_t H = h2o_heavy_budget;
     const uint32_t M = h2o_memory_size;
@@ -1198,6 +1198,14 @@ void llama_kv_cache::h2o_build_memory_set(int32_t il, uint32_t chunk_end) {
 
     h2o_memory_initialized = true;
 
+    if (std::getenv("H2O_DEBUG_MEMIDX") && il == 0) {
+        fprintf(stderr, "[H2O] mem_idx layer %d chunk_end=%u head0=[", il, chunk_end);
+        for (uint32_t m = 0; m < M; ++m) {
+            fprintf(stderr, "%d%s", mem_idx_data[m], (m + 1 < M) ? ", " : "");
+        }
+        fprintf(stderr, "]\n");
+    }
+
     if (debug >= 2) {
         LLAMA_LOG_DEBUG("%s: [H2O] layer %d chunk_end=%u: memory set initialized (L=%u H=%u)\n",
                 __func__, il, chunk_end, L, H);
@@ -1212,7 +1220,25 @@ ggml_tensor * llama_kv_cache::h2o_gather_k_memory(ggml_context * ctx, int32_t il
     const kv_layer & layer = layers[il_cache];
     ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
 
-    ggml_tensor * k_mem = ggml_get_rows(ctx, layer.k, mem_idx);
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    const uint32_t n_embd_head_k = hparams.n_embd_head_k;
+    const uint32_t n_embd_k_gqa = layer.k->ne[0];
+    const int64_t kv_size = layer.k->ne[1];
+    const int64_t n_stream = layer.k->ne[2];
+
+    GGML_ASSERT(n_head_kv > 0);
+    GGML_ASSERT(n_embd_k_gqa == n_embd_head_k * n_head_kv);
+    GGML_ASSERT(n_stream == 1 || mem_idx->ne[2] == n_stream);
+
+    ggml_tensor * k_view = ggml_view_4d(ctx, layer.k,
+            n_embd_head_k, n_head_kv, kv_size, n_stream,
+            ggml_row_size(layer.k->type, n_embd_head_k),
+            ggml_row_size(layer.k->type, n_embd_k_gqa),
+            ggml_row_size(layer.k->type, n_embd_k_gqa * kv_size),
+            0);
+    ggml_tensor * k_perm = ggml_permute(ctx, k_view, 0, 2, 1, 3);
+    ggml_tensor * k_rows = ggml_get_rows(ctx, k_perm, mem_idx);
+    ggml_tensor * k_mem = ggml_permute(ctx, k_rows, 0, 2, 1, 3);
     ggml_set_name(k_mem, "h2o_k_mem");
 
     return k_mem;
@@ -1226,7 +1252,36 @@ ggml_tensor * llama_kv_cache::h2o_gather_v_memory(ggml_context * ctx, int32_t il
     const kv_layer & layer = layers[il_cache];
     ggml_tensor * mem_idx = h2o_memory_indices[il_cache];
 
-    ggml_tensor * v_mem = ggml_get_rows(ctx, layer.v, mem_idx);
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    const uint32_t n_embd_head_v = hparams.n_embd_head_v;
+    const uint32_t n_embd_v_gqa = layer.v->ne[0];
+    const int64_t kv_size = layer.v->ne[1];
+    const int64_t n_stream = layer.v->ne[2];
+
+    GGML_ASSERT(n_head_kv > 0);
+    GGML_ASSERT(n_embd_v_gqa >= n_embd_head_v * n_head_kv);
+    GGML_ASSERT(n_stream == 1 || mem_idx->ne[2] == n_stream);
+
+    ggml_tensor * v_view = ggml_view_4d(ctx, layer.v,
+            n_embd_head_v, n_head_kv, kv_size, n_stream,
+            ggml_row_size(layer.v->type, n_embd_head_v),
+            ggml_row_size(layer.v->type, n_embd_v_gqa),
+            ggml_row_size(layer.v->type, n_embd_v_gqa * kv_size),
+            0);
+    ggml_tensor * v_perm = ggml_permute(ctx, v_view, 0, 2, 1, 3);
+    ggml_tensor * v_rows = ggml_get_rows(ctx, v_perm, mem_idx);
+    ggml_tensor * v_mem = v_trans
+        ? ggml_permute(ctx, v_rows, 2, 0, 1, 3)
+        : ggml_permute(ctx, v_rows, 0, 2, 1, 3);
+    if (debug >= 2) {
+        LLAMA_LOG_DEBUG("%s: v_view ne=[%lld,%lld,%lld,%lld] v_perm ne=[%lld,%lld,%lld,%lld] v_rows ne=[%lld,%lld,%lld,%lld] v_mem ne=[%lld,%lld,%lld,%lld] v_trans=%d\n",
+                __func__,
+                (long long) v_view->ne[0], (long long) v_view->ne[1], (long long) v_view->ne[2], (long long) v_view->ne[3],
+                (long long) v_perm->ne[0], (long long) v_perm->ne[1], (long long) v_perm->ne[2], (long long) v_perm->ne[3],
+                (long long) v_rows->ne[0], (long long) v_rows->ne[1], (long long) v_rows->ne[2], (long long) v_rows->ne[3],
+                (long long) v_mem->ne[0], (long long) v_mem->ne[1], (long long) v_mem->ne[2], (long long) v_mem->ne[3],
+                v_trans ? 1 : 0);
+    }
     ggml_set_name(v_mem, "h2o_v_mem");
 
     return v_mem;

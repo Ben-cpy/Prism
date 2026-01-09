@@ -62,6 +62,14 @@ uint32_t llama_hparams::n_gqa(uint32_t il) const {
     return n_head/n_head_kv;
 }
 
+llama_attn_head_type llama_hparams::attn_head_type(uint32_t il) const {
+    if (il < n_layer) {
+        return static_cast<llama_attn_head_type>(attn_head_type_arr[il]);
+    }
+
+    GGML_ABORT("fatal error");
+}
+
 uint32_t llama_hparams::n_embd_inp() const {
     uint32_t n_embd_inp = n_embd;
 

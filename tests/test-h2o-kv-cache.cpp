@@ -124,7 +124,7 @@ int main(int argc, char ** argv) {
     log_step("kv cache constructed");
     const ggml_tensor * scores = kv.h2o_get_scores_tensor(il);
     const ggml_tensor * mem_idx = kv.h2o_get_memory_indices_tensor(il);
-    const uint32_t n_head = hparams.n_head(il);
+    const uint32_t n_head = hparams.n_head_mem(il);
     const uint32_t memory_size = kv.h2o_get_memory_size();
 
     fprintf(stderr, "[H2O KV] n_head=%u kv_size=%u memory_size=%u\n", n_head, kv_size, memory_size);

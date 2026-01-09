@@ -150,7 +150,7 @@ void test_local_window(const llama_model & model, int32_t il) {
 
     auto kv = make_kv_cache(model, kv_size, h2o_local, h2o_heavy);
 
-    const uint32_t n_head = model.hparams.n_head(il);
+    const uint32_t n_head = model.hparams.n_head_mem(il);
     std::vector<float> colsum(n_head * chunk_len, 0.1f);
 
     kv->h2o_init_chunk_scores(il, 0, chunk_len, colsum.data());
@@ -178,7 +178,7 @@ void test_heavy_hitters_and_heads(const llama_model & model, int32_t il) {
 
     auto kv = make_kv_cache(model, kv_size, h2o_local, h2o_heavy);
 
-    const uint32_t n_head = model.hparams.n_head(il);
+    const uint32_t n_head = model.hparams.n_head_mem(il);
     std::vector<float> colsum(n_head * chunk_len, 0.0f);
 
     for (uint32_t h = 0; h < n_head; ++h) {
@@ -249,7 +249,7 @@ void test_small_sequence(const llama_model & model, int32_t il) {
 
     auto kv = make_kv_cache(model, kv_size, h2o_local, h2o_heavy);
 
-    const uint32_t n_head = model.hparams.n_head(il);
+    const uint32_t n_head = model.hparams.n_head_mem(il);
     std::vector<float> colsum(n_head * chunk_len, 0.5f);
 
     kv->h2o_init_chunk_scores(il, 0, chunk_len, colsum.data());
@@ -278,7 +278,7 @@ void test_cross_chunk_propagation(const llama_model & model, int32_t il) {
 
     auto kv = make_kv_cache(model, kv_size, h2o_local, h2o_heavy);
 
-    const uint32_t n_head = model.hparams.n_head(il);
+    const uint32_t n_head = model.hparams.n_head_mem(il);
     const uint32_t M = kv->h2o_get_memory_size();
 
     std::vector<float> chunk0_scores(n_head * chunk_len, 0.1f);
