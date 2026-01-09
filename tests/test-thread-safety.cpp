@@ -7,17 +7,91 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <cstdlib>
+
 #include "llama.h"
 #include "arg.h"
 #include "common.h"
 #include "log.h"
 #include "sampling.h"
 
+namespace {
+const char * get_env_non_empty(const char * name) {
+    const char * value = std::getenv(name);
+    return (value && value[0] != '\0') ? value : nullptr;
+}
+
+const char * get_test_model_path() {
+    if (const char * value = get_env_non_empty("LLAMACPP_TEST_MODELFILE")) {
+        return value;
+    }
+    if (const char * value = get_env_non_empty("LLAMA_ARG_MODEL")) {
+        return value;
+    }
+    if (const char * value = get_env_non_empty("LLAMA_TEST_MODEL")) {
+        return value;
+    }
+    return nullptr;
+}
+
+bool should_force_cpu_for_test_model() {
+    const char * force_gpu = get_env_non_empty("LLAMA_TEST_THREAD_SAFETY_GPU");
+    return force_gpu == nullptr || force_gpu[0] == '0';
+}
+
+bool is_model_source_arg(const std::string & arg) {
+    return arg == "-m" || arg == "--model" ||
+           arg == "-hf" || arg == "-hfr" || arg == "--hf-repo" ||
+           arg == "-hfd" || arg == "-hfrd" || arg == "--hf-repo-draft" ||
+           arg == "-hff" || arg == "--hf-file" ||
+           arg == "-mu" || arg == "--model-url" ||
+           arg == "-dr" || arg == "--docker-repo";
+}
+
+void build_args_with_model(int argc, char ** argv, const char * model_path, std::vector<std::string> & out) {
+    out.clear();
+    out.reserve(static_cast<size_t>(argc) + 4);
+    out.emplace_back(argv[0]);
+    out.emplace_back("--model");
+    out.emplace_back(model_path);
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (is_model_source_arg(arg)) {
+            if (i + 1 < argc) {
+                ++i;
+            }
+            continue;
+        }
+        out.emplace_back(arg);
+    }
+}
+}
+
 int main(int argc, char ** argv) {
     common_params params;
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    const char * test_model_path = get_test_model_path();
+    const bool force_cpu = test_model_path != nullptr && should_force_cpu_for_test_model();
+    std::vector<std::string> argv_storage;
+    std::vector<char *> argv_override;
+    if (test_model_path != nullptr) {
+        build_args_with_model(argc, argv, test_model_path, argv_storage);
+        argv_override.reserve(argv_storage.size());
+        for (auto & arg : argv_storage) {
+            argv_override.push_back(const_cast<char *>(arg.c_str()));
+        }
+    }
+
+    char ** argv_used = argv_override.empty() ? argv : argv_override.data();
+    int argc_used = argv_override.empty() ? argc : static_cast<int>(argv_override.size());
+
+    if (!common_params_parse(argc_used, argv_used, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
+    }
+    if (force_cpu) {
+        params.n_gpu_layers = 0;
+        params.main_gpu = -1;
     }
 
     common_init();
@@ -40,14 +114,16 @@ int main(int argc, char ** argv) {
 
     int dev_count = ggml_backend_dev_count();
     std::vector<std::array<ggml_backend_dev_t, 2>> gpus;
-    for (int i = 0; i < dev_count; ++i) {
-        auto * dev = ggml_backend_dev_get(i);
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            gpus.push_back({dev, nullptr});
+    if (!force_cpu) {
+        for (int i = 0; i < dev_count; ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                gpus.push_back({dev, nullptr});
+            }
         }
     }
     const int gpu_dev_count = (int)gpus.size();
-    const int num_models = gpu_dev_count + 1 + 1; // GPUs + 1 CPU model + 1 layer split
+    const int num_models = force_cpu ? 1 : (gpu_dev_count + 1 + 1); // GPUs + 1 CPU model + 1 layer split
     //const int num_models = std::max(1, gpu_dev_count);
     const int num_contexts = std::max(1, params.n_parallel);
 
@@ -58,14 +134,17 @@ int main(int argc, char ** argv) {
     for (int m = 0; m < num_models; ++m) {
         auto mparams = common_model_params_to_llama(params);
 
-        if (m < gpu_dev_count) {
+        if (!force_cpu && m < gpu_dev_count) {
             mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
             mparams.devices = gpus[m].data();
-        } else if (m == gpu_dev_count) {
+        } else if (!force_cpu && m == gpu_dev_count) {
             mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
             mparams.main_gpu = -1; // CPU model
-        } else {
+        } else if (!force_cpu) {
             mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        } else {
+            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+            mparams.main_gpu = -1;
         }
 
         llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
