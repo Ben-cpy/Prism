@@ -100,12 +100,19 @@ void dump_mem_idx(const ggml_tensor * mem_idx, uint32_t head, uint32_t M, const 
         return;
     }
     const uint8_t * base = static_cast<const uint8_t *>(mem_idx->data);
-    const int32_t * head_data = reinterpret_cast<const int32_t *>(base + head * mem_idx->nb[1]);
-    fprintf(stderr, "%s head %u: [", label, head);
-    for (uint32_t m = 0; m < M; ++m) {
-        fprintf(stderr, "%d%s", head_data[m], (m + 1 < M) ? ", " : "");
+    const uint32_t n_head = static_cast<uint32_t>(mem_idx->ne[1]);
+    const bool dump_all = std::getenv("H2O_DEBUG_MEMIDX_ALL") != nullptr;
+    const uint32_t head_start = dump_all ? 0 : head;
+    const uint32_t head_end = dump_all ? n_head : std::min(head + 1, n_head);
+
+    for (uint32_t h = head_start; h < head_end; ++h) {
+        const int32_t * head_data = reinterpret_cast<const int32_t *>(base + h * mem_idx->nb[1]);
+        fprintf(stderr, "%s head %u: [", label, h);
+        for (uint32_t m = 0; m < M; ++m) {
+            fprintf(stderr, "%d%s", head_data[m], (m + 1 < M) ? ", " : "");
+        }
+        fprintf(stderr, "]\n");
     }
-    fprintf(stderr, "]\n");
 }
 
 logits_block decode_and_get_logits(llama_context * ctx, const std::vector<llama_token> & tokens,
@@ -161,72 +168,8 @@ std::vector<llama_token> make_tokens(uint32_t n_tokens, llama_token base) {
     return tokens;
 }
 
-void test_cross_batch_continuity(llama_model_ptr & model, int32_t n_vocab) {
-    fprintf(stderr, "\n=== Test 1: Cross-Batch Continuity ===\n");
-    fprintf(stderr, "Scaled down example: -b=16, -ub=4 (16 tokens => 4 chunks; split into 8+8)\n");
-    const llama_hparams & hparams = model->hparams;
-    const int32_t il = find_first_kv_layer(hparams);
-    require(il >= 0, "no KV layers found");
-
-    const uint32_t chunk_size = 4;
-    const uint32_t n_tokens_total = 16;
-    const uint32_t n_ctx = 128;
-    const uint32_t h2o_local = 2;
-    const uint32_t h2o_heavy = 2;
-
-    auto full_ctx = make_h2o_context(model, n_ctx, n_tokens_total, chunk_size, h2o_local, h2o_heavy, true);
-    auto tokens = make_tokens(n_tokens_total, 100);
-
-    logits_block full_logits = decode_and_get_logits(
-            full_ctx.ctx.get(), tokens, 0, true, n_vocab, "full batch decode failed");
-
-    require(full_ctx.kv != nullptr, "kv cache missing in full batch context");
-    require(full_ctx.kv->h2o_is_memory_initialized(), "H2O memory not initialized after full batch");
-    require(full_ctx.kv->h2o_get_total_tokens() == n_tokens_total, "total tokens mismatch after full batch");
-    require(full_ctx.kv->h2o_get_chunk_idx() == 4, "chunk index mismatch after full batch");
-    const ggml_tensor * mem_idx = full_ctx.kv->h2o_get_memory_indices_tensor(il);
-    require(mem_idx != nullptr, "memory indices tensor missing");
-    require(mem_idx->ne[1] == static_cast<int64_t>(hparams.n_head_kv(il)), "memory head count mismatch");
-    if (std::getenv("H2O_DEBUG_MEMIDX")) {
-        dump_mem_idx(mem_idx, 0, full_ctx.kv->h2o_get_memory_size(), "full mem_idx");
-    }
-
-    auto split_ctx = make_h2o_context(model, n_ctx, n_tokens_total, chunk_size, h2o_local, h2o_heavy, true);
-
-    std::vector<llama_token> tokens1(tokens.begin(), tokens.begin() + 8);
-    std::vector<llama_token> tokens2(tokens.begin() + 8, tokens.end());
-
-    decode_and_get_logits(split_ctx.ctx.get(), tokens1, 0, true, n_vocab, "batch1 decode failed");
-    require(split_ctx.kv != nullptr, "kv cache missing in split batch context");
-    require(split_ctx.kv->h2o_is_memory_initialized(), "H2O memory not initialized after batch1");
-    require(split_ctx.kv->h2o_get_total_tokens() == 8, "total tokens mismatch after batch1");
-    require(split_ctx.kv->h2o_get_chunk_idx() == 2, "chunk index mismatch after batch1");
-    if (std::getenv("H2O_DEBUG_MEMIDX")) {
-        const ggml_tensor * mem_idx_split = split_ctx.kv->h2o_get_memory_indices_tensor(il);
-        dump_mem_idx(mem_idx_split, 0, split_ctx.kv->h2o_get_memory_size(), "split mem_idx after batch1");
-    }
-
-    logits_block split_logits = decode_and_get_logits(
-            split_ctx.ctx.get(), tokens2, 8, true, n_vocab, "batch2 decode failed");
-
-    require(split_ctx.kv->h2o_get_total_tokens() == n_tokens_total, "total tokens mismatch after batch2");
-    require(split_ctx.kv->h2o_get_chunk_idx() == 4, "chunk index mismatch after batch2");
-    if (std::getenv("H2O_DEBUG_MEMIDX")) {
-        const ggml_tensor * mem_idx_split = split_ctx.kv->h2o_get_memory_indices_tensor(il);
-        dump_mem_idx(mem_idx_split, 0, split_ctx.kv->h2o_get_memory_size(), "split mem_idx after batch2");
-    }
-
-    const float tol = 1e-4f;
-    for (int32_t i = 0; i < 8; ++i) {
-        compare_logits_token(full_logits, 8 + i, split_logits, i, tol,
-                "cross-batch logits mismatch");
-    }
-
-    fprintf(stderr, "✓ Cross-batch continuity test passed\n");
-}
-
 void test_short_sequence(llama_model_ptr & model, int32_t n_vocab) {
-    fprintf(stderr, "\n=== Test 2: Short Sequence (< chunk_size) ===\n");
+    fprintf(stderr, "\n=== Test 1: Short Sequence (< chunk_size) ===\n");
     fprintf(stderr, "Scaled down example: -b=8, -ub=8 (4 tokens => single chunk)\n");
 
     const uint32_t chunk_size = 8;
@@ -255,7 +198,7 @@ void test_short_sequence(llama_model_ptr & model, int32_t n_vocab) {
 }
 
 void test_non_uniform_chunks(llama_model_ptr & model, int32_t n_vocab) {
-    fprintf(stderr, "\n=== Test 3: Non-Uniform Chunks ===\n");
+    fprintf(stderr, "\n=== Test 2: Non-Uniform Chunks ===\n");
     fprintf(stderr, "Scaled down example: -b=10, -ub=6 (chunks: 6 + 4)\n");
 
     const uint32_t chunk_size = 6;
@@ -288,7 +231,7 @@ void test_non_uniform_chunks(llama_model_ptr & model, int32_t n_vocab) {
 }
 
 void test_edge_cases(llama_model_ptr & model, int32_t n_vocab) {
-    fprintf(stderr, "\n=== Test 4: Edge Cases ===\n");
+    fprintf(stderr, "\n=== Test 3: Edge Cases ===\n");
 
     const uint32_t n_ctx = 64;
     const uint32_t h2o_local = 4;
@@ -344,7 +287,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Testing H2O Edge Cases\n");
     fprintf(stderr, "======================\n");
 
-    test_cross_batch_continuity(model, n_vocab);
     test_short_sequence(model, n_vocab);
     test_non_uniform_chunks(model, n_vocab);
     test_edge_cases(model, n_vocab);

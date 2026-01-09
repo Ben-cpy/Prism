@@ -143,6 +143,22 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 │      • M_c = Local_c ∪ Heavy_c                                      │
 │      • Drop non-selected tokens (keep only M_c for next step)       │
 └─────────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DECODE PHASE (AFTER PREFILL)                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  H2O mode is DISABLED during decode - use standard full attention   │
+│                                                                     │
+│  For each generated token t:                                        │
+│      • Full attention over entire KV cache [0, N + t)               │
+│      • Store K(t), V(t) at position N + t in KV cache               │
+│      • No H2O scoring or memory set updates                         │
+│                                                                     │
+│  Rationale:                                                         │
+│      • Decode is O(N+t) per token, not the bottleneck               │
+│      • Full KV storage ensures generation quality                   │
+│      • Simpler implementation - reuse existing decode path          │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 #### 1.2.6 Key Design Principles

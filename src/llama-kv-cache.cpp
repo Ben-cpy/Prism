@@ -1198,13 +1198,27 @@ void llama_kv_cache::h2o_build_memory_set(int32_t il, uint32_t chunk_end) {
 
     h2o_memory_initialized = true;
 
-    if (std::getenv("H2O_DEBUG_MEMIDX") && il == 0) {
-        fprintf(stderr, "[H2O] mem_idx layer %d chunk_end=%u head0=[", il, chunk_end);
-        for (uint32_t m = 0; m < M; ++m) {
-            fprintf(stderr, "%d%s", mem_idx_data[m], (m + 1 < M) ? ", " : "");
+    if (std::getenv("H2O_DEBUG_MEMIDX")) {
+        const char * layer_env = std::getenv("H2O_DEBUG_MEMIDX_LAYER");
+        if (layer_env != nullptr) {
+            const int layer_id = std::atoi(layer_env);
+            if (il != layer_id) {
+                goto h2o_memidx_done;
+            }
+        } else if (std::getenv("H2O_DEBUG_MEMIDX_ALL_LAYERS") == nullptr && il != 0) {
+            goto h2o_memidx_done;
         }
-        fprintf(stderr, "]\n");
+        const bool dump_all = std::getenv("H2O_DEBUG_MEMIDX_ALL") != nullptr;
+        const uint32_t head_end = dump_all ? n_head : 1;
+        for (uint32_t h = 0; h < head_end; ++h) {
+            fprintf(stderr, "[H2O] mem_idx layer %d chunk_end=%u head%u=[", il, chunk_end, h);
+            for (uint32_t m = 0; m < M; ++m) {
+                fprintf(stderr, "%d%s", mem_idx_data[h * M + m], (m + 1 < M) ? ", " : "");
+            }
+            fprintf(stderr, "]\n");
+        }
     }
+h2o_memidx_done:
 
     if (debug >= 2) {
         LLAMA_LOG_DEBUG("%s: [H2O] layer %d chunk_end=%u: memory set initialized (L=%u H=%u)\n",

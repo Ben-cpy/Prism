@@ -9,6 +9,11 @@ Implement the foundational data structures for chunked sparse attention with H2O
 3. **Chunk metadata** for boundary tracking and progress monitoring
 4. **New SWA type**: `LLAMA_SWA_TYPE_H2O = 4` integrated into existing architecture
 
+**Scope Clarification**:
+- H2O sparse attention is applied **only during prefill** (processing user input)
+- **Decode phase** (generating output tokens) uses **standard full attention** with all KV stored
+- This design choice simplifies implementation and ensures generation quality
+
 **Design Decisions** (from user input):
 - ✅ Extend existing `llama_kv_cache` structures (not create new classes)
 - ✅ Use BF16 (GGML_TYPE_BF16) for score accumulation
