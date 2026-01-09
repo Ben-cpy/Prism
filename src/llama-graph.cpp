@@ -1967,7 +1967,9 @@ ggml_tensor * llm_graph_context::build_attn_h2o(
                 token_offset * intra_m_full->nb[0]);
 
         const auto * mctx_kv = inp->mctx;
-        const bool use_inter = token_offset > 0 && mctx_kv->h2o_is_memory_initialized();
+        // Use absolute position instead of batch-relative offset
+        // This correctly handles cross-batch scenarios where batch2 chunk0 needs batch1 memory
+        const bool use_inter = ubatch.pos[0] > 0 && mctx_kv->h2o_is_memory_initialized();
 
         ggml_tensor * fused = nullptr;
         if (use_inter) {

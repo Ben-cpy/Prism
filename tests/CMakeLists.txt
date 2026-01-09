@@ -200,6 +200,8 @@ llama_build_and_test(test-h2o-memory-selection.cpp)
 target_include_directories(test-h2o-memory-selection PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-h2o-two-phase-prefill.cpp)
 target_include_directories(test-h2o-two-phase-prefill PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-h2o-edge-cases.cpp)
+target_include_directories(test-h2o-edge-cases PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

@@ -1469,10 +1469,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     memory_update(false);
 
     const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
-    const bool h2o_prefill = h2o_enabled && n_tokens_all > 1;
     const uint32_t h2o_chunk_size = h2o_enabled
         ? (cparams.n_ubatch > 0 ? cparams.n_ubatch : cparams.n_batch)
         : cparams.n_ubatch;
+    // Only enable H2O prefill when multiple chunks exist
+    // Single-chunk sequences use traditional full attention (no H2O overhead)
+    const bool h2o_prefill = h2o_enabled && n_tokens_all > h2o_chunk_size;
     const uint32_t h2o_n_chunks = h2o_enabled
         ? (n_tokens_all + h2o_chunk_size - 1) / h2o_chunk_size
         : 0;
