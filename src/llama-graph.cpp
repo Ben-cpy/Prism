@@ -2139,7 +2139,8 @@ namespace {
         ggml_tensor * logits_shifted = ggml_sub(ctx, logits_f32, m_broadcast);
 
         constexpr float k_softmax_ftz_threshold = -20.0f;
-        ggml_tensor * ftz_mask = ggml_step(ctx, ggml_add(ctx, logits_shifted, ggml_new_f32(ctx, -k_softmax_ftz_threshold)));
+        ggml_tensor * logits_ftz = ggml_scale_bias(ctx, logits_shifted, 1.0f, -k_softmax_ftz_threshold);
+        ggml_tensor * ftz_mask = ggml_step(ctx, logits_ftz);
 
         ggml_tensor * exp_logits = ggml_exp(ctx, logits_shifted);
         exp_logits = ggml_mul(ctx, exp_logits, ftz_mask);
@@ -2249,15 +2250,18 @@ void llm_graph_context::init_online_softmax_state_h2o(
     ggml_tensor * kqv = nullptr;
 
     const bool v_is_values = v_mem->ne[1] == inter_logits->ne[0] && v_mem->ne[2] == inter_logits->ne[2];
-    if (v_is_values) {
+    const bool v_is_values_swapped = v_mem->ne[1] == inter_logits->ne[2] && v_mem->ne[2] == inter_logits->ne[0];
+    if (v_is_values || v_is_values_swapped) {
         ggml_tensor * logits = inter_logits;
         if (!ggml_is_contiguous(logits)) {
             logits = ggml_cont(ctx0, logits);
         }
         ggml_tensor * kq = ggml_soft_max_ext(ctx0, logits, nullptr, 1.0f, 0.0f);
         ggml_tensor * v = v_mem;
+        if (v_is_values_swapped) {
+            v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        }
         const bool v_trans = v->nb[1] > v->nb[2];
-        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
         if (!v_trans) {
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
         }
@@ -2280,15 +2284,18 @@ ggml_tensor * llm_graph_context::update_online_softmax_state_h2o(
     ggml_tensor * kqv = nullptr;
 
     const bool v_is_values = v_intra->ne[1] == intra_logits->ne[0] && v_intra->ne[2] == intra_logits->ne[2];
-    if (v_is_values) {
+    const bool v_is_values_swapped = v_intra->ne[1] == intra_logits->ne[2] && v_intra->ne[2] == intra_logits->ne[0];
+    if (v_is_values || v_is_values_swapped) {
         ggml_tensor * logits = intra_logits;
         if (!ggml_is_contiguous(logits)) {
             logits = ggml_cont(ctx0, logits);
         }
         ggml_tensor * kq = ggml_soft_max_ext(ctx0, logits, nullptr, 1.0f, 0.0f);
         ggml_tensor * v = v_intra;
+        if (v_is_values_swapped) {
+            v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        }
         const bool v_trans = v->nb[1] > v->nb[2];
-        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
         if (!v_trans) {
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
         }
