@@ -2,19 +2,19 @@
 
 ## Overview
 
-This task **validates** the H2O memory set selection mechanism (`h2o_build_memory_set`) implemented in Task 1. The actual integration into the execution path happens in **Task 5** as part of Phase 2 processing.
+This task **validates and documents** the H2O memory set selection mechanism (`h2o_build_memory_set`) implemented in Task 1, and aligns the docs with the **current execution path**.
 
-**Key Clarification (Two-Phase Design)**:
-- Memory set M₀ is built **after Phase 1 completes** (i.e., after all chunks finish intra-attention in parallel)
-- Memory sets M₁, M₂, ... are built **during Phase 2** (sequential processing), after each chunk's inter-attention
-- **This task does NOT add `h2o_build_memory_set` calls per-chunk in Phase 1** - that happens in Task 5's Phase 2
+**Key Clarification (Two-Phase Design, current code)**:
+- Memory set **M₀** is built **during Phase 1**, after intra‑attention colsum is read back (only for chunk 0).
+- Memory sets **M₁, M₂, ...** are built **during Phase 2**, after each chunk's inter‑attention.
+- **Phase 1 does not call** `h2o_next_chunk()`; **Phase 2 does** after each chunk.
 
-**Scope**: Validation of Task 1 implementation through unit tests. Integration into Phase 2 is deferred to Task 5.
+**Scope**: Validation of Task 1 implementation through unit tests, plus documentation of Phase‑1/Phase‑2 integration points already present in `src/llama-context.cpp`.
 
 **Dependencies**:
 - ✅ Task 1: H2O data structures (`h2o_scores`, `h2o_memory_indices`, `h2o_build_memory_set`)
 - ✅ Task 2: Intra-chunk attention with weight extraction
-- ✅ Task 3: Score tracking integration (`h2o_init_chunk_scores`) - Phase 1 only, no `h2o_next_chunk` calls
+- ✅ Task 3: Score tracking integration (`h2o_init_chunk_scores`) + Phase‑2 sequencing hooks (`h2o_next_chunk`)
 
 ---
 
@@ -39,7 +39,7 @@ This function implements:
 - `h2o_gather_k_memory(ctx, il)` - Gather K for memory set
 - `h2o_gather_v_memory(ctx, il)` - Gather V for memory set
 
-### Current Execution Flow (Task 3 - Phase 1 Only)
+### Current Execution Flow (Phase 1 + Phase 2)
 
 **File**: `src/llama-context.cpp`
 
@@ -50,38 +50,41 @@ After Phase 1 graph compute (all chunks processed in parallel via block-diagonal
 for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
     // ... extract chunk_colsum from t_h2o_colsum ...
     kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
-    // DO NOT call h2o_next_chunk() or h2o_build_memory_set() here!
+    // Build M0 once after chunk0 scores are ready
+    if (chunk_idx == 0 && !kv->h2o_is_memory_initialized()) {
+        kv->h2o_build_memory_set(layer.il, chunk_end);
+    }
 }
-// Phase 2 (Task 5): Sequential processing with inter-attention + memory set building
+// Phase 2: Sequential processing with inter-attention + memory set building
 ```
 
-**Memory Set Build Timing (implemented in Task 5)**:
-1. After Phase 1 completes → Build M₀ from chunk 0 scores
-2. After each chunk c's inter-attention in Phase 2 → Build Mₖ for next chunk
+**Memory Set Build Timing (current code)**:
+1. Phase 1: Build **M₀** from chunk 0 scores (after colsum is available)
+2. Phase 2: After each chunk c’s inter‑attention → Build **M_c** for the next chunk
 
 ---
 
 ## Implementation Steps
 
-### Step 1: Validate Memory Set Construction Logic (Unit Tests Only)
+### Step 1: Validate Memory Set Construction Logic (Unit Tests)
 
-**Clarification**: This task validates the `h2o_build_memory_set` implementation from Task 1 through unit tests. The actual **integration** into the main execution path is done in **Task 5**.
+**Clarification**: This task validates the `h2o_build_memory_set` implementation from Task 1 through unit tests. The **integration points already exist** in the main execution path:
+- Phase 1 builds **M₀** after intra colsum is available.
+- Phase 2 rebuilds **M_c** after each chunk’s inter‑attention.
 
-**Why NOT add per-chunk memory set construction in Phase 1**:
-- In the two-phase design, Phase 1 processes all chunks in parallel (intra-attention only)
-- Memory set M₀ should only be built **after Phase 1 completes**, not during Phase 1 chunk processing
-- Memory sets M₁, M₂, ... are built **during Phase 2**, after each chunk's inter-attention
-- Building memory sets per-chunk in Phase 1 is wasteful since those sets would not be used until Phase 2
+**Why only build M₀ in Phase 1**:
+- Phase 1 processes all chunks in parallel (intra‑attention only).
+- M₀ is needed to bootstrap inter‑attention for chunk 1 in Phase 2.
+- Building memory sets for every chunk in Phase 1 would be unused until Phase 2.
 
 **Task 4 Scope**:
 1. Write unit tests to validate `h2o_build_memory_set` logic
 2. Verify local window extraction, heavy hitter selection, cross-chunk propagation
 3. Ensure sorted indices and proper memory constraints
 
-**Integration (Task 5 - Phase 2)**:
+**Integration (current code)**:
 ```cpp
-// Phase 2 pseudocode (implemented in Task 5, NOT Task 4)
-// After Phase 1 completes:
+// Phase 1 (after colsum readback):
 h2o_build_memory_set(il, S);  // Build M₀ from chunk 0
 
 for (chunk_idx = 1; chunk_idx < n_chunks; ++chunk_idx) {
@@ -95,18 +98,16 @@ for (chunk_idx = 1; chunk_idx < n_chunks; ++chunk_idx) {
 
 ---
 
-### Step 2: Add Debug Logging (Optional but Recommended)
+### Step 2: Debug Logging (already present)
 
-**File**: `src/llama-kv-cache.cpp:1184` (end of `h2o_build_memory_set`)
+**File**: `src/llama-kv-cache.cpp` (end of `h2o_build_memory_set`)
 
-Add logging to show memory set stats:
-
-```cpp
-if (debug >= 2) {
-    LLAMA_LOG_DEBUG("%s: [H2O] layer %d chunk_end=%u: memory set initialized (L=%u H=%u)\n",
-                    __func__, il, chunk_end, L, H);
-}
-```
+Current code already logs memory‑set construction when `debug >= 2`, and supports
+env‑based dumps:
+- `H2O_DEBUG_MEMIDX=1` to print memory indices
+- `H2O_DEBUG_MEMIDX_LAYER=<id>` to filter by layer
+- `H2O_DEBUG_MEMIDX_ALL_LAYERS=1` to dump all layers
+- `H2O_DEBUG_MEMIDX_ALL=1` to dump all heads (otherwise head 0 only)
 
 ---
 
@@ -602,7 +603,7 @@ void benchmark_prefill_throughput() {
 
 | File | Lines to Modify | Description |
 |------|----------------|-------------|
-| `src/llama-context.cpp` | ~1635 (after `h2o_next_chunk`) | Add `h2o_build_memory_set` call in chunk loop |
+| `src/llama-context.cpp` | Phase 1 + Phase 2 blocks | Build **M₀** after Phase‑1 colsum; rebuild **M_c** after Phase‑2 inter‑attn; `h2o_next_chunk()` per chunk |
 | `tests/test-h2o-memory-selection.cpp` | ~800 (new file) | Comprehensive tests for all metrics |
 | `tests/CMakeLists.txt` | +3 | Register new test |
 | `tasks/task_4.md` | New | This document |
@@ -613,8 +614,8 @@ void benchmark_prefill_throughput() {
 ## Deliverables
 
 ### Code Changes
-- [ ] `src/llama-context.cpp`: Integrate `h2o_build_memory_set` into chunk loop
-- [ ] Optional: Add debug logging for memory set construction
+- [ ] `src/llama-context.cpp`: Verify Phase‑1 **M₀** build + Phase‑2 **M_c** build + `h2o_next_chunk()` sequencing
+- [ ] Optional: Use existing debug logging / env dumps for memory set inspection
 
 ### Tests
 - [ ] `tests/test-h2o-memory-selection.cpp`: 10 correctness metrics
@@ -657,7 +658,7 @@ ctest --test-dir build -R test-h2o-memory-selection -V --output-on-failure
 ## Success Criteria
 
 ✅ **Integration**:
-- [ ] `h2o_build_memory_set` called after each chunk in main execution path
+- [ ] `h2o_build_memory_set` called for **M₀** after Phase‑1 colsum and for **M_c** after each Phase‑2 chunk
 - [ ] Memory sets built for all KV layers
 - [ ] No crashes or assertion failures
 
@@ -687,10 +688,9 @@ ctest --test-dir build -R test-h2o-memory-selection -V --output-on-failure
 ## Next Steps After Task 4
 
 **Task 5**: Inter-Chunk Attention + Online Softmax Fusion
-- Use `h2o_gather_k_memory` / `h2o_gather_v_memory` to get memory set KV
-- Implement inter-chunk attention (Q_c × K_M_{c-1})
-- Fuse with intra-chunk attention using online softmax
-- Update scores via `h2o_accumulate_memory_scores`
+- Validate and refine inter‑chunk attention + online softmax fusion (already wired in Phase 2)
+- Ensure `h2o_gather_k_memory` / `h2o_gather_v_memory` are correct for all layers/heads
+- Verify score accumulation via `h2o_accumulate_memory_scores`
 
 **Task 6**: Full Pipeline Integration
 - Integrate inter-chunk + intra-chunk attention into model graph
@@ -709,7 +709,6 @@ ctest --test-dir build -R test-h2o-memory-selection -V --output-on-failure
 
 ## Notes
 
-- Inter-chunk attention is **NOT** part of Task 4 (deferred to Task 5)
-- Memory sets are built but not yet used (will be used in Task 5)
-- Focus on correctness and integration, not performance optimization
-- All core algorithms already exist from Task 1 - this is just wiring them up
+- Inter‑chunk attention is already used in Phase 2 when memory is initialized and `ubatch.pos[0] > 0`.
+- Memory sets are built in Phase 1 (M₀) and consumed in Phase 2; then rebuilt per chunk.
+- Focus on correctness and integration; performance optimization remains later work.
