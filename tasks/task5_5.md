@@ -159,6 +159,15 @@ Add a **skip‑store** path for Phase‑2:
   - `h2o_accumulate_memory_scores` on `M_{c-1}`
   - `h2o_build_memory_set` for chunk c
 
+**Final partial chunk (sync with `tasks/whole_plan.md`)**:
+- “Final chunk” here means the **tail of the user’s full prompt**, i.e., the last chunk in the entire prompt sequence.
+  It is **not** the last `ubatch` of each `-b` batch if the prompt requires multiple `-b` calls.
+- The final chunk may be shorter than `n_ubatch`.
+- After finishing inter + intra fusion for the final chunk:
+  - **Do not** build a new memory set (no next prefill chunk will consume it).
+  - **Do not** advance chunk state; prefill ends here.
+  - KV for the final chunk is still stored at positions `[chunk_start, N)`.
+
 This matches the plan’s scoring rules.
 
 ---
