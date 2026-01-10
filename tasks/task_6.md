@@ -143,6 +143,151 @@ Query positions →
 
 ---
 
+### Step 7: Decode phase handling (Full KV cache, H2O disabled)
+
+**Files**
+- `src/llama-context.cpp`
+- `src/llama-graph.cpp`
+
+**What to do**
+
+#### 7.1 Prefill-to-Decode Transition
+
+After prefill completes, the KV cache contains:
+1. **Memory set tokens**: The final $M = L + H$ tokens selected by H2O from all previous chunks (**with $M < \text{chunk\_size}$**)
+2. **Final chunk tokens**: Complete KV for the last chunk (may be partial, i.e., < `chunk_size`)
+
+**Critical**: No additional scoring or eviction happens after the final chunk. The KV cache state at prefill end becomes the initial state for decode.
+
+#### 7.2 Final Chunk Special Handling
+
+The final chunk requires special attention:
+
+```
+Example: N = 4096 + 500 tokens, chunk_size = 1024
+
+Prefill chunks:
+  Chunk 0: [0, 1023]      → intra-attn only, build M₀
+  Chunk 1: [1024, 2047]   → inter-attn(M₀) + intra, build M₁
+  Chunk 2: [2048, 3071]   → inter-attn(M₁) + intra, build M₂
+  Chunk 3: [3072, 4095]   → inter-attn(M₂) + intra, build M₃
+  Chunk 4: [4096, 4595]   → inter-attn(M₃) + intra, **NO M₄ build**
+                            ↑ Final partial chunk (500 tokens)
+
+KV cache at decode start:
+  - Memory set M₃: 512 tokens (indices scattered across [0, 4095])
+  - Final chunk: 500 tokens at positions [4096, 4595]
+  - Total effective KV: M₃ ∪ [4096, 4595] (but stored as full cache)
+```
+
+**Implementation**:
+```cpp
+// In llama_decode_internal, after all chunks processed:
+
+const bool is_final_chunk = (chunk_idx == n_chunks - 1);
+const uint32_t final_chunk_len = n_tokens_all - chunk_idx * h2o_chunk_size;
+
+if (is_final_chunk) {
+    // 1. Compute inter-attention with M_{k-1}
+    // 2. Fuse with intra-attention via online softmax
+    // 3. DO NOT call h2o_build_memory_set() - prefill ends here
+    // 4. DO NOT call h2o_next_chunk() - no more chunks to process
+    
+    // The KV cache now contains:
+    //   - Memory set indices at their original global positions
+    //   - Final chunk KV at positions [final_chunk_start, final_chunk_end)
+}
+```
+
+#### 7.3 Decode Phase Execution
+
+**Detection**: Decode mode is detected when `ubatch.n_tokens == 1`.
+
+**Behavior when H2O enabled but in decode mode**:
+
+```cpp
+const bool is_decode = (ubatch.n_tokens == 1);
+const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
+
+if (h2o_enabled && is_decode) {
+    // === STANDARD DECODE PATH (H2O bypassed) ===
+    
+    // 1. Use standard attention (build_attn), NOT build_attn_h2o
+    // 2. Attend to FULL KV cache: all positions [0, current_pos)
+    // 3. Store new K, V at position current_pos (standard KV cache write)
+    // 4. NO H2O scoring updates
+    // 5. NO memory set modifications
+}
+```
+
+**Why full attention during decode**:
+- Decode complexity is $O(N + t)$ per token where $t$ = tokens generated
+- This is **not** the bottleneck (prefill's $O(N^2)$ is)
+- Full KV ensures maximum generation quality
+- Simpler implementation: reuse existing llama.cpp decode path entirely
+
+#### 7.4 KV Cache State During Decode
+
+```
+Decode token t₁ (first generated token):
+  ┌────────────────────────────────────────────────────────┐
+  │ KV Cache after prefill:                                │
+  │   [0, N-1] = prompt KV (sparse during prefill,         │
+  │              but all positions written)                │
+  │                                                        │
+  │ For decode token at position N:                        │
+  │   Q(t₁) attends to K[0:N], V[0:N]  (FULL attention)    │
+  │   Store K(t₁), V(t₁) at position N                     │
+  └────────────────────────────────────────────────────────┘
+
+Decode token t₂:
+  ┌────────────────────────────────────────────────────────┐
+  │ Q(t₂) attends to K[0:N+1], V[0:N+1]                    │
+  │ Store K(t₂), V(t₂) at position N+1                     │
+  └────────────────────────────────────────────────────────┘
+
+... and so on for subsequent tokens
+```
+
+#### 7.5 Implementation Checklist
+
+1. **Detect decode mode**: `ubatch.n_tokens == 1`
+2. **Bypass H2O attention**: Use `build_attn()` instead of `build_attn_h2o()`
+3. **Full KV access**: No memory set gathering, attend to entire cache
+4. **Standard KV write**: Store K, V at `kv_head + n_past` as normal
+5. **Skip H2O state updates**: No `h2o_init_chunk_scores`, `h2o_accumulate_memory_scores`, `h2o_build_memory_set`, or `h2o_next_chunk`
+
+**Code change** (in `llama_decode_internal`):
+
+```cpp
+// At the start of decode processing:
+const bool is_decode_phase = (n_tokens_all == 1);
+
+if (h2o_enabled && !is_decode_phase) {
+    // H2O prefill path: two-phase processing
+    // ... (existing H2O logic)
+} else {
+    // Standard path: either decode (single token) or non-H2O prefill
+    // ... (existing standard llama_decode logic)
+}
+```
+
+---
+
+## Verification Metrics (Decode Phase)
+
+| Metric | Target | How to Verify |
+|--------|--------|---------------|
+| Decode uses full attention | No H2O masking | Check attention covers [0, current_pos) |
+| KV correctly appended | Position N+t stored | Verify `kv_cache.cells[N+t]` populated |
+| No H2O state changes | Scores unchanged | Compare scores before/after decode |
+| Generation quality | Match baseline | Compare output text vs non-H2O model |
+| Decode latency | No regression | Benchmark decode tok/s |
+
+---
+
+---
+
 ## Verification Metrics
 
 | Metric | Target | How to Verify |
@@ -173,12 +318,14 @@ Query positions →
 - Run repeated prefill calls on the same prompt.
 - Confirm no memory leak or unexpected cache reuse.
 
----
-
 ## Success Criteria
 
 ✅ H2O prefill works end-to-end for multi-chunk prompts  
 ✅ Single chunk path uses standard attention with no H2O overhead  
 ✅ No crashes on partial tail chunks  
 ✅ Score tracking and memory set updates occur once per chunk  
-✅ Online softmax fusion is numerically stable (no NaN/Inf)
+✅ Online softmax fusion is numerically stable (no NaN/Inf)  
+✅ **Final chunk does NOT build memory set (prefill termination)**  
+✅ **Decode phase uses standard full attention (H2O bypassed)**  
+✅ **KV cache correctly stores decode tokens at positions N, N+1, ...**  
+✅ **Generation quality matches baseline (non-H2O) decode**
