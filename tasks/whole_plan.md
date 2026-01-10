@@ -1,5 +1,21 @@
 # Chunked Sparse Attention for Prefill Optimization
 
+## Terminology
+
+| Term | Definition | llama.cpp Flag |
+|------|------------|----------------|
+| **request** | Single user prompt (we only support 1 concurrent request) | - |
+| **logical batch** | Max tokens per `llama_decode()` call | `-b` / `n_batch` |
+| **chunk** | Physical processing unit within a logical batch | `-ub` / `n_ubatch` |
+| **chunk_size** | Size of one chunk (= `n_ubatch`) | `-ub` |
+| **memory set** | Selected KV tokens (Local + Heavy) for inter-chunk attention | - |
+| **Phase 1** | Parallel intra-chunk attention for all chunks in a logical batch | - |
+| **Phase 2** | Sequential inter-chunk attention + fusion | - |
+
+**Important**: "batch" in H2O context always means **logical batch** (`n_batch`), 
+not concurrent request count. We assume single-request inference (batch=1 in the 
+traditional sense).
+
 ## Implementation Plan v1.0
 
 ---
@@ -26,15 +42,36 @@ We replace full causal attention with a **block-sparse approximation** that main
     - Result: All chunks can compute intra-attention simultaneously without cross-chunk dependencies
 - **Inter-chunk**: Attention only to a bounded subset $\mathcal{M}_c$ of historical KV pairs
 
-#### 1.2.1 Notation
+#### 1.2.1 Notation and llama.cpp Parameter Mapping
 
-- $N$: Total sequence length
-- $S$: Chunk size (hyperparameter, default 1024)
-- $k = \lceil N/S \rceil$: Number of chunks
-- $C_c = \{cS, \ldots, \min((c+1)S-1, N-1)\}$: Token indices in chunk $c$
+**Symbol Definitions**:
+- $N$: Total prompt length (user input tokens)
+- $B$: Logical batch size (`-b` / `n_batch`, default 2048) - max tokens per `llama_decode()` call
+- $S$: Chunk size (`-ub` / `n_ubatch`, default 512) - physical processing unit
+- $k_B = \lceil B/S \rceil$: Number of chunks per logical batch (e.g., 4 when $B=4096, S=1024$)
+- $n_B = \lceil N/B \rceil$: Number of logical batches for full prompt
+- $k = \lceil N/S \rceil$: Total number of chunks (global)
+- $C_c$: Token indices in chunk $c$ (global indexing across all logical batches)
 - $L$: Local window size (hyperparameter, default 256)
 - $H$: Heavy hitter budget (hyperparameter, default 256)
-- $M = L + H$: Total memory size (default 512)
+- $M = L + H$: Total memory size (must satisfy **$M < S$**)
+
+**llama.cpp Parameter Mapping**:
+
+| Our Term | llama.cpp Flag | Default | Description |
+|----------|----------------|---------|-------------|
+| Chunk size ($S$) | `-ub` / `--ubatch-size` | 512 | Physical batch: tokens processed in one compute pass |
+| Logical batch ($B$) | `-b` / `--batch-size` | 2048 | Max tokens per `llama_decode()` call |
+| Local window ($L$) | `--h2o-local` | 256 | Recent tokens always retained |
+| Heavy budget ($H$) | `--h2o-heavy` | 256 | Score-based token budget |
+
+**Recommended Configuration** (for this plan's examples):
+```bash
+-b 4096 -ub 1024 --h2o-local 256 --h2o-heavy 256
+# B=4096, S=1024 → k_B = 4 chunks per logical batch
+
+
+
 
 #### 1.2.2 Core Idea: Block-Accumulated Attention Fusion
 
@@ -57,16 +94,16 @@ The online softmax maintains running statistics $(m, \ell, o)$ that allow combin
 
 **Execution Schedule (Prefill)**:
 - **Phase 1 (Parallel)**: All chunks compute **intra-attention** simultaneously:
-  - $Q(C_c) \times K(C_c)^T$ with causal mask → store intra logits/output
+  - $Q(C_c) \times K(C_c)^T$ with causal mask → store intra online-softmax state $(m,l,o)$
   - Initialize scores for tokens in $C_c$ from intra-attention column sums
 - **Phase 2 (Sequential)**: For each chunk $C_c$ (where $c \geq 1$):
   1. Compute **inter-attention**: $Q(C_c) \times K(\mathcal{M}_{c-1})^T$ (no mask)
   2. **Update scores** for tokens in $\mathcal{M}_{c-1}$ using inter-attention weights
-  3. **Fuse** inter + stored intra results via online softmax to get final output
+  3. **Fuse** inter state + cached intra $(m,l,o)$ via online softmax to get final output
 
 #### 1.2.3 Memory Set Construction (H2O-like Selection)
 
-The memory set $\mathcal{M}_c$ (used by chunk $C_{c+1}$) has a fixed size of $M = L + H = 512$ tokens, composed of:
+The memory set $\mathcal{M}_c$ (used by chunk $C_{c+1}$) has a fixed size of $M = L + H$ tokens, with **$M < S$** (chunk size), composed of:
 
 $$\mathcal{M}_c = \underbrace{\text{Local}_c}_{\text{forced retention}} \cup \underbrace{\text{Heavy}_c}_{\text{score-based selection}}$$
 
@@ -108,7 +145,7 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 │  • Split prompt into chunks C₀..Cₖ₋₁                                │
 │  • For each chunk C_c in parallel:                                  │
 │      - Compute intra(C_c) with causal mask                           │
-│      - Store K/V + intra logits/output                               │
+│      - Store K/V + intra online-softmax state (m, l, o)               │
 │      - Initialize scores from intra(C_c) column-sum                  │
 └─────────────────────────────────────────────────────────────────────┘
                                     ↓
@@ -132,8 +169,8 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 │      • For each j ∈ M_{c-1}: score(j) += Σᵢ A_inter(i,j)            │
 │                                                                     │
 │  Step 3: Online Softmax Fusion                                      │
-│      • Initialize state from inter-attention                        │
-│      • Update with stored intra(C_c) logits/output                  │
+│      • Initialize state from inter-attention (m/l + o_inter)         │
+│      • Fuse with cached intra state (m/l/o)                          │
 │      • Fuse → final attention output for C_c                         │
 │                                                                     │
 │  Step 4: Build M_c for next chunk                                   │
@@ -143,22 +180,115 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 │      • M_c = Local_c ∪ Heavy_c                                      │
 │      • Drop non-selected tokens (keep only M_c for next step)       │
 └─────────────────────────────────────────────────────────────────────┘
-                            ↓
+
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    DECODE PHASE (AFTER PREFILL)                     │
 ├─────────────────────────────────────────────────────────────────────┤
-│  H2O mode is DISABLED during decode - use standard full attention   │
+│  H2O sparse prefill is inactive during decode; attention is full    │
+│  causal and no H2O score/memory updates are applied                 │
 │                                                                     │
-│  For each generated token t:                                        │
-│      • Full attention over entire KV cache [0, N + t)               │
-│      • Store K(t), V(t) at position N + t in KV cache               │
-│      • No H2O scoring or memory set updates                         │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ PREFILL → DECODE TRANSITION                                  │   │
+│  │                                                              │   │
+│  │ After final chunk Cₖ₋₁ (which may be partial):              │   │
+│  │   1. Inter-attention: Q(Cₖ₋₁) × K(Mₖ₋₂)ᵀ                    │   │
+│  │   2. Online softmax fusion with intra-attention              │   │
+│  │   3. Store final chunk KV at positions [chunk_start, N)      │   │
+│  │   4. Memory set updates are no longer consumed in decode      │   │
+│  │                                                              │   │
+│  │ KV cache state at decode start:                              │   │
+│  │   • All N prompt positions have KV stored                    │   │
+│  │   • H2O scoring/selection is frozen (not used in decode)     │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ DECODE EXECUTION (for each generated token tᵢ)              │   │
+│  │                                                              │   │
+│  │ Detection: ubatch.n_tokens == 1                              │   │
+│  │                                                              │   │
+│  │ For generated token at position N + i:                       │   │
+│  │   1. Project Q, K, V for single token                        │   │
+│  │   2. Apply RoPE with position = N + i                        │   │
+│  │   3. **FULL attention**: Q × K[0:N+i]ᵀ (no H2O masking)      │   │
+│  │   4. Store K(tᵢ), V(tᵢ) at position N + i in KV cache        │   │
+│  │   5. No H2O score updates, no memory set changes             │   │
+│  │                                                              │   │
+│  │ Implementation: build_attn_h2o path may be used, but the mask │   │
+│  │ collapses to standard causal attention when n_tokens <= S,   │   │
+│  │ and score updates are skipped (ubatch.n_tokens == 1)          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 │  Rationale:                                                         │
-│      • Decode is O(N+t) per token, not the bottleneck               │
-│      • Full KV storage ensures generation quality                   │
-│      • Simpler implementation - reuse existing decode path          │
+│      • Decode is O(N+t) per token, not the O(N²) bottleneck         │
+│      • Full KV storage ensures maximum generation quality           │
+│      • Simpler implementation - reuse existing decode path entirely │
+│      • H2O overhead would slow decode with no meaningful benefit    │
 └─────────────────────────────────────────────────────────────────────┘
+
+#### 1.2.8 Final Chunk and Decode Transition Details
+
+**Final Chunk Handling**:
+
+The final chunk of prefill may not be a full `chunk_size` tokens:
+
+```
+Example: N = 3500, chunk_size = 1024
+
+Chunk 0: positions [0, 1023]     - 1024 tokens (full)
+Chunk 1: positions [1024, 2047]  - 1024 tokens (full)
+Chunk 2: positions [2048, 3071]  - 1024 tokens (full)
+Chunk 3: positions [3072, 3499]  - 428 tokens (partial, final)
+```
+
+**Processing the final chunk**:
+1. Compute intra-attention for the 428-token partial chunk
+2. Compute inter-attention against memory set M₂
+3. Fuse via online softmax
+4. Store KV for positions [3072, 3499]
+5. **Skip** building M₃ - there's no next prefill chunk to use it
+6. **Skip** advancing chunk state - prefill is complete
+
+**KV Cache State at Decode Start**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Position:  0    1024   2048   3072   3500                       │
+│            ├─────┼──────┼──────┼──────┤                         │
+│ Content:   │ C₀  │  C₁  │  C₂  │ C₃   │  ← All KV stored        │
+│            └─────┴──────┴──────┴──────┘                         │
+│                                                                 │
+│ During prefill, attention was sparse (via memory sets).         │
+│ During decode, attention is FULL over [0, current_pos).         │
+│                                                                 │
+│ Decode tokens will be appended starting at position 3500:       │
+│            ├─────┼──────┼──────┼──────┼─┬─┬─┬─┬─...             │
+│            │ C₀  │  C₁  │  C₂  │ C₃   │t₁│t₂│t₃│t₄│             │
+│            └─────┴──────┴──────┴──────┴─┴─┴─┴─┴─...             │
+│                                        ↑                        │
+│                                   Decode tokens                 │
+│                                   (full attention,              │
+│                                    full KV storage)             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why No H2O During Decode?**
+
+| Aspect | Prefill | Decode |
+|--------|---------|--------|
+| Tokens per call | N (thousands) | 1 |
+| Complexity | O(N²) with chunking | O(N+t) per token |
+| Bottleneck | Yes (TTFT) | No (TPS limited by other factors) |
+| H2O benefit | High (quadratic → linear) | Minimal (already linear) |
+| Quality risk | Acceptable (sparse approx) | Unacceptable (generation quality) |
+
+**Implementation Simplicity**:
+
+By using the standard decode path:
+- No changes to existing decode logic
+- No additional H2O state management during decode
+- No risk of H2O bugs affecting generation
+- Easy to verify correctness (decode unchanged from baseline)
+
 ```
 
 #### 1.2.6 Key Design Principles
@@ -338,6 +468,12 @@ def populate_kv_cache(cache, k, v, chunk_idx, chunk_size):
 - Only **memory tokens** receive score updates from inter-attention
 - **Current chunk tokens** receive initial scores from intra-attention
 
+#### Implementation Notes (current code)
+- H2O **prefill** activates only when the prompt spans **multiple chunks** (`n_tokens_all > n_ubatch`). Single‑chunk sequences use standard full attention.
+- **Phase 1** uses `n_batch` (logical batch) with a **block‑diagonal causal mask** to process all chunks in parallel and caches intra online‑softmax state (`o/l/m`).
+- After Phase‑1 colsum readback, scores are initialized for **all chunks** and **M₀** is built from chunk 0.
+- **Phase 2** runs per‑chunk (`n_ubatch`). Inter‑attention is used only when `ubatch.pos[0] > 0` and memory is initialized; then scores accumulate, **M_c** is rebuilt, and `h2o_next_chunk()` advances the chunk state.
+
 #### Subtasks
 
 **3.1 Score Storage Structure**
@@ -451,6 +587,11 @@ $$\text{Candidates} = (\mathcal{M}_{c-1} \cup C_c) \setminus \text{Local}_c$$
 
 This means tokens from earlier chunks (e.g., $C_0$) can survive into $\mathcal{M}_1, \mathcal{M}_2, \ldots$ if they continue receiving high attention scores.
 
+#### Implementation Notes (current code)
+- `h2o_build_memory_set()` is called **once in Phase 1** to build **M₀** after intra colsum is available.
+- In **Phase 2**, after each chunk’s inter‑attention, scores accumulate and **M_c** is rebuilt; `h2o_next_chunk()` advances the chunk boundary.
+- Local window uses `chunk_end - L` clamped to 0; candidates are `(prev_memory ∪ current_chunk) \ local`.
+
 #### Subtasks
 
 **4.1 Local Window Extraction**
@@ -472,7 +613,7 @@ This means tokens from earlier chunks (e.g., $C_0$) can survive into $\mathcal{M
 
 **4.4 Memory Set Assembly**
 - Combine: $\mathcal{M}_c = \text{Local}_c \cup \text{Heavy}_c$
-- Total size: $M = L + H = 512$
+- Total size: $M = L + H$ (with $M < S$)
 - Sort indices for coalesced memory access (important for CUDA performance)
 
 **4.5 KV Gather Operation**
@@ -577,6 +718,10 @@ For chunks $c \geq 1$, the order is:
 
 This order allows score updates for memory tokens to happen before building the next memory set.
 
+**Implementation note (llama.cpp)**:
+- Phase 1 computes intra logits once and exports cached $(m, \ell, o)$ for the full prompt.
+- Phase 2 does **not** recompute intra logits; it fuses inter state with cached intra $(m, \ell, o)$ using max/scale factors.
+
 **5.3 State Initialization from Inter-Attention**
 ```python
 # After computing inter-attention logits [num_heads, chunk_len, M]
@@ -588,6 +733,7 @@ exp_logits = exp(inter_logits - m.unsqueeze(-1))  # [H, S, M]
 l = exp_logits.sum(dim=-1)  # [H, S]
 o = einsum('hsm,hmd->hsd', exp_logits, V_mem)  # [H, S, d]
 ```
+Implementation detail: the code may reuse the already-computed inter output as `o` and only uses `inter_logits` for `m` and `l`.
 
 **5.4 State Update from Intra-Attention**
 ```python
@@ -609,6 +755,15 @@ correction_new = exp(m_new - m_merged)
 l = l * correction_old + l_new * correction_new
 o = o * correction_old.unsqueeze(-1) + o_new * correction_new.unsqueeze(-1)
 m = m_merged
+```
+
+**Phase-2 fusion with cached intra (actual code path)**:
+```python
+m_total = maximum(m_inter, m_intra)
+scale_inter = exp(m_inter - m_total)
+scale_intra = exp(m_intra - m_total)
+l_total = l_inter * scale_inter + l_intra * scale_intra
+o_total = (o_inter * l_inter * scale_inter + o_intra * l_intra * scale_intra) / l_total
 ```
 
 **5.5 Finalization**
@@ -867,6 +1022,8 @@ Task 1 → Task 2 → Task 5 → Task 6 → Task 8
 
 ## Appendix A: Reference Implementation Pseudocode
 
+**Note**: The production code uses a two-phase schedule (Phase 1 parallel intra for all chunks, Phase 2 sequential inter + fusion) and caches per-layer $(m, \ell, o)$ for intra. The pseudocode below is a conceptual single-pass view.
+
 ```python
 def chunked_sparse_prefill(input_ids, model, config):
     """
@@ -876,7 +1033,7 @@ def chunked_sparse_prefill(input_ids, model, config):
         chunk_size: S = 1024,
         local_window: L = 256,
         heavy_hitter_budget: H = 256,
-        memory_size: M = L + H = 512
+        memory_size: M = L + H (M < S)
     }
     """
     N = len(input_ids)
@@ -1072,6 +1229,8 @@ $$C_{\text{ours}} = O(N(S + M)) = O(N(S + L + H))$$
 | $k$ | Number of chunks ($\lceil N/S \rceil$) | 4 |
 
 # Addition note
-+ 由于当前编程框架是 llama.cpp 框架, 它提供了2个有关 batch 的操作 -b 和 -ub. 为了和我们例子对齐, 实际运行的时候, 我们会传入 -b设置为 4096, -ub 设计为1024. 并且在第一阶段prefill阶段, -b中的所有物理批都是并行计算prefill chunk 内的注意力的.
-    * **-b 逻辑批大小 默认2048, 相当于**虽然你有 4096 个 token，但单次只能提交 2048 个给 llama_decode()
-    * -ub 物理批大小 默认512,  这 2048 个 token 被 -ub（物理批大小）分割, preifll 阶段顺序执行4个物理批, 一次处理512 token
++ 说明：llama.cpp 提供 -b（n_batch）和 -ub（n_ubatch）。为与示例对齐，运行时使用 -b=4096、-ub=1024。
++ 原生 llama.cpp prefill 会把 -b 拆成多个 -ub **顺序**执行。
++ H2O 两阶段中：Phase 1 使用 block‑diagonal mask 一次性处理 n_batch（并行 intra），Phase 2 再按 n_ubatch 顺序处理。
+    * **-b 逻辑批大小**默认 2048；示例中设为 4096
+    * -ub 物理批大小 默认 512；原生/Phase 2 都按 -ub 顺序处理

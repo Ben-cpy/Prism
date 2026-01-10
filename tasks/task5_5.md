@@ -61,18 +61,21 @@ Add a new cache container (host‑side, per layer):
 ```cpp
 struct h2o_prefill_cache {
     // per layer:
-    std::vector<std::vector<float>> intra_o; // [il] -> [n_embd_head_v * n_tokens * n_head]
-    std::vector<std::vector<float>> intra_l; // [il] -> [n_tokens * n_head]
+    std::vector<std::vector<float>> intra_o; // [il] -> [n_embd_head_v * n_tokens * n_head * n_stream] normalized output
+    std::vector<std::vector<float>> intra_l; // [il] -> [n_tokens * n_head * n_stream] sum exp(logit - m)
+    std::vector<std::vector<float>> intra_m; // [il] -> [n_tokens * n_head * n_stream] row-wise max logits
     uint32_t n_tokens = 0;
     uint32_t n_head = 0;
     uint32_t n_embd_head_v = 0;
+    uint32_t n_stream = 1;
+    llama_pos base_pos = 0;
     bool initialized = false;
 };
 ```
 
 **Notes**:
-- Store **online softmax state** (o, l) instead of full logits to avoid O(N²) memory.
-- Shapes match per‑head outputs: `o_intra` in per‑head layout `[d_head, n_tokens, n_head]`.
+- Store **online softmax state** (o, l, m) instead of full logits to avoid O(N²) memory.
+- Shapes match per‑head outputs: `o_intra` in per‑head layout `[d_head, n_tokens, n_head, n_stream]`.
 
 ---
 
@@ -84,14 +87,16 @@ struct h2o_prefill_cache {
 
 In `current_phase == 1`:
 - Use `build_attn_h2o` to compute **intra** only (no inter).
-- Compute and **export**:
-  - `o_intra = softmax(logits_intra) @ V_intra`
-  - `l_intra = sum(exp(logits_intra))`
+- Compute and **export** online‑softmax state from **intra logits**:
+  - `m_intra = rowwise_max(logits_intra)`
+  - `l_intra = sum(exp(logits_intra - m_intra))`
+  - `o_intra = softmax(logits_intra) @ V_intra` (normalized output)
 
 These become graph outputs so Phase‑1 results can be copied to host:
 ```cpp
 res->t_h2o_intra_o[il] = o_intra;
 res->t_h2o_intra_l[il] = l_intra;
+res->t_h2o_intra_m[il] = m_intra;
 ```
 
 **Verification**:
@@ -110,15 +115,23 @@ In `current_phase == 2`:
 - Create **input tensors** from `h2o_prefill_cache`:
   - `intra_o_input`
   - `intra_l_input`
+  - `intra_m_input`
 - Slice to current chunk (`[chunk_start, chunk_end)`) using `ggml_view_*`.
+  - Use `token_offset = ubatch.pos[0] - base_pos` to index into cached full‑prompt tensors.
 - Compute inter attention to memory set:
-  - `o_inter`, `l_inter`
-- Fuse:
+  - `inter_logits` (for m/l)
+  - `inter_out` (normalized output)
+- Initialize inter state and **fuse with cached intra**:
 ```
-o_total = o_inter + o_intra
-l_total = l_inter + l_intra
-out = o_total / l_total
+m_total = max(m_inter, m_intra)
+scale_inter = exp(m_inter - m_total)
+scale_intra = exp(m_intra - m_total)
+l_inter = l_inter * scale_inter
+l_intra = l_intra * scale_intra
+o_sum = (o_inter * l_inter) + (o_intra * l_intra)
+out = o_sum / (l_inter + l_intra)
 ```
+If `use_inter == false` (chunk 0), `out = o_intra`.
 
 ---
 
@@ -129,14 +142,7 @@ out = o_total / l_total
 
 Add a **skip‑store** path for Phase‑2:
 - Phase 1 writes K/V to KV cache.
-- Phase 2 must **not** call `cpy_k/cpy_v` again.
-
-Option A:
-```cpp
-if (current_phase == 2) { skip cpy_k/cpy_v; }
-```
-Option B:
-Introduce a new helper `build_attn_h2o_no_store(...)`.
+- Phase 2 **skips** `cpy_k/cpy_v` when `current_phase == 2` inside `build_attn_h2o`.
 
 ---
 
@@ -165,6 +171,7 @@ This matches the plan’s scoring rules.
 
 Ensure `current_phase` is part of `llm_graph_params::allow_reuse` so:
 - Phase‑1 graph won’t be reused for Phase‑2 (or vice versa).
+Also ensure `llm_graph_input_h2o_intra::can_reuse` checks `ubatch.pos[0]` and cache sizes.
 
 ---
 

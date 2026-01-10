@@ -140,7 +140,51 @@ Query positions →
    - Ensure no out-of-bounds access when slicing KV or colsum buffers.
 3. Disable H2O for non-text or multi-sequence inputs (keep scope to single-batch text).
 
+### Step 6.5: Cross-Batch Memory Set Inheritance
 
+**Files**
+- `src/llama-context.cpp`
+
+**What to do**
+
+When `n_tokens_all > n_batch` (prompt longer than single logical batch):
+
+1. **First batch (batch_idx = 0)**:
+   - Process as normal: Phase 1 → Phase 2 → build M_{k-1}
+   - **DO NOT reset** H2O state after completion
+
+2. **Subsequent batches (batch_idx > 0)**:
+   - **Inherit** memory set M_{prev} from previous batch
+   - First chunk of new batch uses inter-attention with M_{prev}
+   - Continue Phase 2 sequential processing
+
+**Example**: 16384 tokens, n_batch=4096, n_ubatch=1024
+
+```
+Batch 0: tokens [0, 4095]
+  Phase 1: all 4 chunks compute intra in parallel
+  Phase 2: sequential inter → produces M₃
+
+Batch 1: tokens [4096, 8191]
+  Phase 1: all 4 chunks compute intra in parallel
+  Phase 2: Chunk 4 uses M₃ (from Batch 0!) → produces M₄, M₅, M₆, M₇
+
+Batch 2: tokens [8192, 12287]
+  Phase 1: all 4 chunks compute intra in parallel
+  Phase 2: Chunk 8 uses M₇ (from Batch 1!) → produces M₈, M₉, M₁₀, M₁₁
+```
+
+**Implementation**:
+```cpp
+// In llama_decode_internal, at the START of each batch:
+const bool is_first_batch = (kv->h2o_get_total_tokens() == 0);
+
+if (!is_first_batch) {
+    // Memory set from previous batch is still valid
+    // h2o_memory_initialized == true
+    // First chunk of this batch will use it for inter-attention
+}
+```
 ---
 
 ### Step 7: Decode phase handling (Full KV cache, H2O disabled)

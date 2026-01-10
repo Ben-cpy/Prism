@@ -149,6 +149,43 @@ llama_context::llama_context(
     }
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+    // with causal attention, the batch size is limited by the context size
+    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+
+    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    // H2O memory size must be strictly smaller than the chunk size (n_ubatch)
+    if (cparams.h2o_local_window + cparams.h2o_heavy_budget > 0) {
+        if (cparams.n_ubatch <= 1) {
+            LLAMA_LOG_WARN("%s: H2O disabled because n_ubatch (%u) <= 1\n", __func__, cparams.n_ubatch);
+            cparams.h2o_local_window = 0;
+            cparams.h2o_heavy_budget = 0;
+        } else {
+            const uint64_t h2o_M = (uint64_t) cparams.h2o_local_window + (uint64_t) cparams.h2o_heavy_budget;
+            if (h2o_M >= cparams.n_ubatch) {
+                const bool even_split = (h2o_M == cparams.n_ubatch) &&
+                        (cparams.h2o_local_window == cparams.h2o_heavy_budget);
+                uint32_t new_local = cparams.h2o_local_window;
+                uint32_t new_heavy = cparams.h2o_heavy_budget;
+                if (new_local >= cparams.n_ubatch) {
+                    new_local = cparams.n_ubatch - 1;
+                    new_heavy = 0;
+                } else {
+                    new_heavy = (cparams.n_ubatch - 1) - new_local;
+                }
+                if (!even_split) {
+                    LLAMA_LOG_WARN("%s: H2O requires L+H < n_ubatch; clamping L=%u H=%u -> L=%u H=%u\n",
+                            __func__,
+                            cparams.h2o_local_window, cparams.h2o_heavy_budget,
+                            new_local, new_heavy);
+                }
+                cparams.h2o_local_window = new_local;
+                cparams.h2o_heavy_budget = new_heavy;
+            }
+        }
+    }
+
     const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
     if (h2o_enabled) {
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
@@ -157,11 +194,6 @@ llama_context::llama_context(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cparams.flash_attn = false;
     }
-
-    // with causal attention, the batch size is limited by the context size
-    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
-
-    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;

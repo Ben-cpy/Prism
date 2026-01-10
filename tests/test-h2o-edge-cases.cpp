@@ -115,6 +115,24 @@ void dump_mem_idx(const ggml_tensor * mem_idx, uint32_t head, uint32_t M, const 
     }
 }
 
+void require_mem_idx_in_range(const ggml_tensor * mem_idx, uint32_t M, int32_t max_pos, const char * label) {
+    require(mem_idx != nullptr, label);
+    const uint8_t * base = static_cast<const uint8_t *>(mem_idx->data);
+    const uint32_t n_head = static_cast<uint32_t>(mem_idx->ne[1]);
+
+    for (uint32_t h = 0; h < n_head; ++h) {
+        const int32_t * head_data = reinterpret_cast<const int32_t *>(base + h * mem_idx->nb[1]);
+        for (uint32_t m = 0; m < M; ++m) {
+            const int32_t pos = head_data[m];
+            if (pos < -1 || pos >= max_pos) {
+                fprintf(stderr, "mem_idx out of range: head=%u m=%u pos=%d (max=%d)\n",
+                        h, m, pos, max_pos);
+                require(false, label);
+            }
+        }
+    }
+}
+
 logits_block decode_and_get_logits(llama_context * ctx, const std::vector<llama_token> & tokens,
         llama_pos base_pos, bool all_logits, int32_t n_vocab, const char * label) {
     llama_batch batch = make_batch(tokens, base_pos, all_logits);
@@ -176,7 +194,7 @@ void test_short_sequence(llama_model_ptr & model, int32_t n_vocab) {
     const uint32_t n_tokens = 4;
     const uint32_t n_ctx = 128;
     const uint32_t h2o_local = 4;
-    const uint32_t h2o_heavy = 4;
+    const uint32_t h2o_heavy = 3;
 
     auto h2o_ctx = make_h2o_context(model, n_ctx, chunk_size, chunk_size, h2o_local, h2o_heavy, true);
     auto base_ctx = make_h2o_context(model, n_ctx, chunk_size, chunk_size, 0, 0, false);
@@ -204,8 +222,8 @@ void test_non_uniform_chunks(llama_model_ptr & model, int32_t n_vocab) {
     const uint32_t chunk_size = 6;
     const uint32_t n_tokens = 10;
     const uint32_t n_ctx = 128;
-    const uint32_t h2o_local = 4;
-    const uint32_t h2o_heavy = 4;
+    const uint32_t h2o_local = 3;
+    const uint32_t h2o_heavy = 2;
 
     auto h2o_ctx = make_h2o_context(model, n_ctx, n_tokens, chunk_size, h2o_local, h2o_heavy, true);
     auto base_ctx = make_h2o_context(model, n_ctx, n_tokens, chunk_size, 0, 0, false);
@@ -221,10 +239,16 @@ void test_non_uniform_chunks(llama_model_ptr & model, int32_t n_vocab) {
     require(h2o_ctx.kv->h2o_get_total_tokens() == n_tokens, "total tokens mismatch after non-uniform decode");
     require(h2o_ctx.kv->h2o_get_chunk_idx() == 2, "chunk index mismatch after non-uniform decode");
 
+    const int32_t il = find_first_kv_layer(model->hparams);
+    require(il >= 0, "model has no kv layer");
+    const uint32_t M = h2o_ctx.kv->h2o_get_memory_size();
+    require_mem_idx_in_range(h2o_ctx.kv->h2o_get_memory_indices_tensor(il), M,
+            static_cast<int32_t>(n_tokens), "memory indices out of range");
+
     const float tol = 1e-4f;
-    for (int32_t i = 0; i < static_cast<int32_t>(n_tokens); ++i) {
+    for (int32_t i = 0; i < static_cast<int32_t>(chunk_size); ++i) {
         compare_logits_token(h2o_logits, i, base_logits, i, tol,
-                "non-uniform chunk logits mismatch");
+                "non-uniform chunk logits mismatch (chunk 0)");
     }
 
     fprintf(stderr, "✓ Non-uniform chunks test passed\n");
@@ -234,10 +258,10 @@ void test_edge_cases(llama_model_ptr & model, int32_t n_vocab) {
     fprintf(stderr, "\n=== Test 3: Edge Cases ===\n");
 
     const uint32_t n_ctx = 64;
-    const uint32_t h2o_local = 4;
-    const uint32_t h2o_heavy = 4;
+    const uint32_t h2o_local = 1;
+    const uint32_t h2o_heavy = 0;
 
-    auto ctx = make_h2o_context(model, n_ctx, 1, 1, h2o_local, h2o_heavy, true);
+    auto ctx = make_h2o_context(model, n_ctx, 2, 2, h2o_local, h2o_heavy, true);
 
     std::vector<llama_token> tokens = { 1 };
     logits_block logits = decode_and_get_logits(

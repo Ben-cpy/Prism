@@ -215,8 +215,8 @@ int32_t find_first_kv_layer(const llama_hparams & hparams) {
 
 void run_score_init_test(llama_model & model, int32_t il) {
     const uint32_t kv_size = 128;
-    const uint32_t h2o_local = 8;
-    const uint32_t h2o_heavy = 8;
+    const uint32_t h2o_local = 2;
+    const uint32_t h2o_heavy = 1;
     const uint32_t chunk_len = 16;
 
     llama_kv_cache kv(

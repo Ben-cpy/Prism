@@ -1,4 +1,5 @@
 # AGNET
++ when you implement and encounter some question, just stop to ask me.
 + this is my whole plan, i would implement this gradualy @Prism/tasks/whole_plan.md
 + this is a jetson device with CUDA, with 12 core, when you build, use the full core
 + models are in the folder /models (this is the root path, not relative path)

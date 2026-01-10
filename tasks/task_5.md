@@ -35,27 +35,43 @@ Implement inter-chunk attention with online softmax fusion to complete the H2O c
 
 ## Implementation Steps
 
-### Step 1: Add Online Softmax State Structures
+### Step 1: Add Prefill Cache + Online Softmax State
 
-**File**: `src/llama-graph.h` (after line 582 in `llm_graph_result`)
+**Files**: `src/llama-context.h`, `src/llama-graph.h`
 
+Host-side cache (Phase 1 → Phase 2):
 ```cpp
-// Online softmax state for chunked attention fusion
+struct h2o_prefill_cache {
+    std::vector<std::vector<float>> intra_o; // [il] -> [n_embd_head_v * n_tokens * n_head * n_stream]
+    std::vector<std::vector<float>> intra_l; // [il] -> [n_tokens * n_head * n_stream]
+    std::vector<std::vector<float>> intra_m; // [il] -> [n_tokens * n_head * n_stream]
+    uint32_t n_tokens = 0;
+    uint32_t n_head = 0;
+    uint32_t n_embd_head_v = 0;
+    uint32_t n_stream = 1;
+    llama_pos base_pos = 0;
+    bool initialized = false;
+};
+```
+
+Graph inputs/outputs:
+```cpp
+class llm_graph_input_h2o_intra : public llm_graph_input_i {
+    std::map<int, ggml_tensor *> intra_o;
+    std::map<int, ggml_tensor *> intra_l;
+    std::map<int, ggml_tensor *> intra_m;
+};
+
 struct h2o_online_softmax_state {
-    ggml_tensor * m;      // [n_tokens, n_head] running max of logits
-    ggml_tensor * l;      // [n_tokens, n_head] running sum exp(logit - m)
-    ggml_tensor * o;      // [n_embd, n_tokens, n_head] running weighted sum
+    ggml_tensor * m; // [1, n_tokens, n_head, n_stream]
+    ggml_tensor * l; // [1, n_tokens, n_head, n_stream]
+    ggml_tensor * o; // [n_embd_head_v, n_tokens, n_head, n_stream]
     bool initialized = false;
 };
 
-// Storage for Phase 1 outputs and Phase 2 fusion
-struct h2o_phase_state {
-    std::map<int, ggml_tensor *> intra_output;   // [il] → output tensor
-    std::map<int, ggml_tensor *> intra_logits;   // [il] → logits before softmax
-    std::map<int, h2o_online_softmax_state> online_state;  // [il] → state
-};
-
-h2o_phase_state h2o_phase;
+std::map<int, ggml_tensor *> t_h2o_intra_o;
+std::map<int, ggml_tensor *> t_h2o_intra_l;
+std::map<int, ggml_tensor *> t_h2o_intra_m;
 ```
 
 ### Step 2: Implement Inter-Chunk Attention
@@ -73,13 +89,13 @@ ggml_tensor * build_attn_inter_h2o(
     ggml_tensor ** inter_weights_out) const;
 ```
 
-### Step 3: Implement Online Softmax Fusion
+### Step 3: Implement Online Softmax Fusion Helpers
 
 **File**: `src/llama-graph.cpp`
 
 Two helper functions:
-1. `init_online_softmax_state_h2o`: Initialize (m, ℓ, o) state from inter-attention
-2. `update_online_softmax_state_h2o`: Update state with intra-attention and finalize
+1. `init_online_softmax_state_h2o`: Initialize (m, ℓ, o) from **inter logits** and **inter output**
+2. `update_online_softmax_state_h2o`: Compute (m, ℓ, o) from **intra logits** (and can merge if state already initialized)
 
 **Function signatures** in `src/llama-graph.h`:
 ```cpp
@@ -107,22 +123,29 @@ Add field:
 ```cpp
 int current_phase = 0;  // 0=normal, 1=phase1, 2=phase2
 ```
+Also pass through `llm_graph_params` and include in `allow_reuse`.
 
 ### Step 6: Implement Two-Phase Orchestration
 
 **File**: `src/llama-context.cpp` (in `llama_decode_internal` around line 1400-1642)
 
 Add two-phase processing logic:
-1. **Phase 1 Loop**: Process all chunks with intra-attention in parallel
-2. **Phase 2 Loop**: Sequentially update chunks 1+ with inter-attention + fusion
+1. **Phase 1 Loop**: `ubatch_size = n_batch`, `current_phase = 1`
+   - capture `t_h2o_intra_o/l/m` and copy to `h2o_prefill_cache`
+   - record `base_pos` for phase‑2 slicing (`token_offset = ubatch.pos[0] - base_pos`)
+   - initialize chunk scores from `t_h2o_colsum`
+2. **Phase 2 Loop**: `ubatch_size = n_ubatch`, `current_phase = 2`
+   - use cached intra state + inter attention
+   - accumulate memory scores from `t_h2o_inter_colsum` and build memory set per chunk
 
 ### Step 7: Modify Graph Building
 
 **File**: `src/llama-graph.cpp` (around line 1933-1963)
 
 Modify attention building section to check `current_phase`:
-- Phase 1: Use existing `build_attn_h2o` (intra-only), store outputs and logits
-- Phase 2: Use `build_attn_inter_h2o` + online softmax fusion for chunks 1+
+- Phase 1: Use `build_attn_mha_h2o` with `attn_logits_out` → compute `m/l/o` and store `t_h2o_intra_*`
+- Phase 2: Load cached `intra_o/l/m` inputs, run `build_attn_inter_h2o`, then fuse using `m_total` + scale factors
+- Skip `cpy_k/cpy_v` in Phase 2 to avoid double KV writes
 
 ## Verification Metrics
 
