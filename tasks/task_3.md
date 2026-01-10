@@ -1,4 +1,16 @@
-# Task 3: Attention Score Tracking + Main-Path H2O Prefill (Chunk = ubatch)
+# Task 3: Attention Score Tracking + Main-Path H2O Prefill
+
+## Terminology Note
+
+| Term | Meaning |
+|------|---------|
+| **chunk** | A processing unit of size `n_ubatch` tokens |
+| **logical batch** | All tokens in one `llama_decode()` call (up to `n_batch`) |
+| **n_ubatch** | Chunk size (default 1024) |
+| **n_batch** | Logical batch size (default 4096 = 4 chunks) |
+
+In this task, **chunk_size = n_ubatch**.
+
 
 ## Overview
 
@@ -9,7 +21,7 @@ This task wires H2O score tracking into the **main inference path** and enables 
 - ✅ Non-iSWA path for H2O
 - ✅ Single-request (n_stream = 1) for now
 - ✅ Chunk size = `n_ubatch`, logical batch = `n_batch`
-- ✅ H2O params exposed in CLI, defaults 256/256
+- ✅ H2O params exposed in CLI, defaults 256/256 (half of default `-ub=512`), with **`L+H < n_ubatch` enforced** (auto‑clamp when needed)
 
 ---
 
@@ -19,7 +31,7 @@ This task wires H2O score tracking into the **main inference path** and enables 
 
 **Files**: `include/llama.h`, `src/llama-context.cpp`, `src/llama-cparams.h`, `common/common.h`, `common/common.cpp`, `common/arg.cpp`
 
-Add two params with defaults (256/256):
+Add two params with defaults (256/256 for the default `-ub=512`, with `L+H < n_ubatch` enforced):
 - `h2o_local_window` (L)
 - `h2o_heavy_budget` (H)
 
@@ -27,17 +39,17 @@ Add two params with defaults (256/256):
 - `include/llama.h`: extend `struct llama_context_params` with:
   - `uint32_t h2o_local_window;`
   - `uint32_t h2o_heavy_budget;`
-- `src/llama-context.cpp`: set defaults in `llama_context_default_params()` to 256/256
+- `src/llama-context.cpp`: set defaults in `llama_context_default_params()` to 256/256 and clamp to keep `L+H < n_ubatch`
 - `src/llama-cparams.h`: carry these params into `llama_cparams`
 - `src/llama-context.cpp`: propagate `params.h2o_*` into `cparams.h2o_*`
-- `common/common.h`: add to `common_params` (defaults 256/256)
+- `common/common.h`: add to `common_params` (defaults 256/256; clamp to keep `L+H < n_ubatch`)
 - `common/common.cpp`: map `common_params -> llama_context_params`
 - `common/arg.cpp`: CLI options
   - `--h2o-local N` (default 256)
-  - `--h2o-heavy N` (default 256)
+  - `--h2o-heavy N` (default 256; auto‑clamp when `L+H >= n_ubatch`)
 
 **Behavior**:
-- H2O enabled when `h2o_local_window + h2o_heavy_budget > 0`.
+- H2O enabled when `h2o_local_window + h2o_heavy_budget > 0` **and** `L+H < n_ubatch` (otherwise clamp to keep `L+H < n_ubatch`).
 - If H2O enabled, force `cparams.flash_attn = false` to guarantee weight extraction path.
 
 ---

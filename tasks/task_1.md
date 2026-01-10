@@ -56,7 +56,7 @@ Add H2O-specific state:
 // H2O hyperparameters
 const uint32_t h2o_local_window = 0;  // L: local window size (e.g., 256)
 const uint32_t h2o_heavy_budget = 0;  // H: heavy hitter budget (e.g., 256)
-const uint32_t h2o_memory_size  = 0;  // M = L + H (e.g., 512)
+const uint32_t h2o_memory_size  = 0;  // M = L + H (must satisfy M < n_ubatch)
 
 // Score tracking: accumulated attention scores for heavy hitter selection
 // Shape per tensor: [kv_size, n_head] (2D, one per layer)

@@ -145,6 +145,9 @@ Modify attention building section to check `current_phase`:
 - [ ] GPU memory stays within limits
 - [ ] CUDA and CPU backends work
 
+### Test Notes
+- `test-h2o-two-phase-prefill` is temporarily removed from the test suite.
+
 ## Build and Test Commands
 
 ```bash

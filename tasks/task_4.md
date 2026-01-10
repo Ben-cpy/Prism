@@ -408,7 +408,7 @@ void test_edge_case_very_small_sequence() {
 
 ### Metric 9: Memory Set Size Constraint
 
-**Test**: Memory set never exceeds M = L + H
+**Test**: Memory set never exceeds M = L + H (with M < S)
 
 ```cpp
 void test_memory_size_constraint() {
