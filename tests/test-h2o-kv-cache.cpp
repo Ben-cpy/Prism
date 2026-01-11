@@ -181,6 +181,7 @@ int main(int argc, char ** argv) {
 
     log_step("build memory set");
     kv.h2o_build_memory_set(il, chunk_len);
+    kv.h2o_set_memory_initialized(true);
     log_step("build memory set done");
 
     const int32_t * mem_idx_data = static_cast<const int32_t *>(mem_idx->data);
@@ -217,6 +218,7 @@ int main(int argc, char ** argv) {
 
     kv.h2o_init_chunk_scores(il, 0, chunk_len, attn_colsum.data());
     kv.h2o_build_memory_set(il, chunk_len);
+    kv.h2o_set_memory_initialized(true);
 
     log_step("reset via seq_rm()");
     kv.h2o_next_chunk(chunk_len);
