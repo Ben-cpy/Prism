@@ -203,6 +203,69 @@ Also ensure `llm_graph_input_h2o_intra::can_reuse` checks `ubatch.pos[0]` and ca
 
 ---
 
+## Detailed Test Plan (Task 5.5)
+
+### A) Unit / Component Tests (ctest)
+These cover the building blocks used by the two‑phase schedule.
+
+1) `test-h2o-online-softmax`
+   - Purpose: verify online‑softmax state (m/l/o) and fusion math used in Phase 2.
+   - Pass criteria: test prints success line and exits 0.
+
+2) `test-h2o-intra-attn`
+   - Purpose: validate intra‑attention correctness (Phase 1 core).
+   - Pass criteria: "H2O intra-attn checks passed" and exit 0.
+
+3) `test-h2o-score-tracking`
+   - Purpose: verify score initialization (from intra colsum) and accumulation (from inter colsum).
+   - Pass criteria: "H2O score tracking checks passed" and exit 0.
+
+4) `test-h2o-memory-selection`
+   - Purpose: validate memory set construction / selection based on scores.
+   - Pass criteria: exits 0 (or prints pass line if present).
+
+5) `test-h2o-gqa-memory`
+   - Purpose: validate GQA head reduction for memory scores (n_head -> n_head_kv).
+   - Pass criteria: exits 0.
+
+6) `test-h2o-edge-cases`
+   - Purpose: boundary cases for chunking and memory init.
+   - Pass criteria: exits 0.
+
+7) `test-h2o-kv-cache`
+   - Purpose: verify KV cache layout and sizes used by H2O.
+   - Pass criteria: exits 0.
+
+### B) Two‑Phase Schedule Log Check (llama-cli)
+Use the debug env vars to confirm Phase 1 runs once and Phase 2 runs per‑chunk, in order.
+
+Command (make a prompt long enough to exceed `-ub`, but <= `-b` so there is only one phase‑1 pass):
+```bash
+python3 - <<'PY'
+text = ("hello ") * 1500
+with open('/tmp/h2o_prompt_1500.txt','w') as f:
+    f.write(text)
+PY
+
+H2O_DEBUG_PHASES=1 H2O_DEBUG_CACHE=1 \
+GGML_CUDA=ON ./build/bin/llama-cli \
+  -m /models/Qwen_Qwen3-1.7B-Q8_0.gguf \
+  -f /tmp/h2o_prompt_1500.txt -n 0 \
+  -b 2048 -ub 1024 --h2o-local 256 --h2o-heavy 256 -st
+```
+
+Expected log checks (manual):
+- Exactly one line with `"[H2O] phase=1"` and `ubatch.n_tokens` close to the prompt length.
+- Two lines with `"[H2O] phase=2"`: first `ubatch.n_tokens=1024`, second is the tail (`<1024`), `chunk_idx` increasing.
+- A `cache ready` line (from `H2O_DEBUG_CACHE=1`) confirming intra cache was filled.
+- For the first phase‑2 chunk (`chunk_idx=0`), `has_prev=0`.
+- For later chunks, `has_prev=1` and `mem_init=1`.
+
+### C) Robustness Smoke (N <= S and partial tail)
+Run a short prompt (`-b 1024 -ub 1024`) to confirm Phase 2 is skipped, then a partial tail (`-b 2048 -ub 1024` with shorter prompt length if possible) to validate last‑chunk behavior. Use `H2O_DEBUG_PHASES=1` to confirm.
+
+---
+
 ## Build & Test
 
 ```bash
