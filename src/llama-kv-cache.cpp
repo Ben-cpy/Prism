@@ -1196,7 +1196,8 @@ void llama_kv_cache::h2o_build_memory_set(int32_t il, uint32_t chunk_end) {
         }
     }
 
-    h2o_memory_initialized = true;
+    // Note: h2o_memory_initialized is set by the caller after ALL layers have been initialized.
+    // This ensures all layers build their memory set before any layer uses inter-attention.
 
     if (std::getenv("H2O_DEBUG_MEMIDX")) {
         const char * layer_env = std::getenv("H2O_DEBUG_MEMIDX_LAYER");

@@ -9,6 +9,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1608,6 +1609,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     auto run_phase = [&](llama_memory_context_ptr & ctx, int phase, bool skip_outputs, uint32_t base_tokens) -> int {
         do {
             const auto & ubatch = ctx->get_ubatch();
+            if (getenv("H2O_DEBUG_PHASES")) {
+                const long long pos0 = ubatch.pos ? (long long) ubatch.pos[0] : -1;
+                fprintf(stderr,
+                        "[H2O] phase=%d ubatch.n_tokens=%u pos0=%lld skip_outputs=%d base_tokens=%u chunk_idx=%u\n",
+                        phase, ubatch.n_tokens, pos0, skip_outputs ? 1 : 0, base_tokens, h2o_chunk_idx);
+            }
 
             // count the outputs in this ubatch
             {
@@ -1675,6 +1682,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 h2o_cache.n_stream = 1;
                 bool filled = false;
 
+                int32_t debug_il = -1;
                 for (const auto & [il, t_intra_o] : res->t_h2o_intra_o) {
                     if (t_intra_o == nullptr) {
                         continue;
@@ -1718,10 +1726,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     h2o_cache.intra_m[il].resize(ggml_nelements(t_intra_m));
                     ggml_backend_tensor_get(t_intra_m, h2o_cache.intra_m[il].data(), 0, h2o_cache.intra_m[il].size() * sizeof(float));
                     filled = true;
+
+                    if (debug_il < 0 && getenv("H2O_DEBUG_CACHE")) {
+                        debug_il = il;
+                    }
                 }
 
                 h2o_cache.initialized = filled;
                 h2o_cache_ready = filled;
+
+                if (filled && debug_il >= 0 && getenv("H2O_DEBUG_CACHE")) {
+                    const auto & o = h2o_cache.intra_o[debug_il];
+                    const auto & l = h2o_cache.intra_l[debug_il];
+                    const auto & m = h2o_cache.intra_m[debug_il];
+                    auto minmax_o = std::minmax_element(o.begin(), o.end());
+                    auto minmax_l = std::minmax_element(l.begin(), l.end());
+                    auto minmax_m = std::minmax_element(m.begin(), m.end());
+                    fprintf(stderr,
+                            "[H2O] cache ready: il=%d tokens=%u head=%u embd_head_v=%u o[min,max]=[%g,%g] l[min,max]=[%g,%g] m[min,max]=[%g,%g]\n",
+                            debug_il, h2o_cache.n_tokens, h2o_cache.n_head, h2o_cache.n_embd_head_v,
+                            o.empty() ? 0.0 : *minmax_o.first, o.empty() ? 0.0 : *minmax_o.second,
+                            l.empty() ? 0.0 : *minmax_l.first, l.empty() ? 0.0 : *minmax_l.second,
+                            m.empty() ? 0.0 : *minmax_m.first, m.empty() ? 0.0 : *minmax_m.second);
+                }
             }
 
             if (h2o_enabled && ubatch.n_tokens > 1 && kv != nullptr && cparams.n_ubatch > 0) {
@@ -1759,6 +1786,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const uint32_t chunk_start = base_tokens + chunk_offset;
                             const uint32_t chunk_end = chunk_start + chunk_len;
 
+                            // For chunk 0, we need to build memory set for ALL layers before setting initialized flag.
+                            // This flag check must be outside the layer loop to avoid early termination.
+                            const bool should_build_m0 = (chunk_idx == 0 && !kv->h2o_is_memory_initialized());
+
                             for (const auto & layer : intra_layers) {
                                 const uint32_t n_kv = static_cast<uint32_t>(layer.tensor->ne[0]);
                                 const uint32_t n_head = static_cast<uint32_t>(layer.tensor->ne[1]);
@@ -1780,9 +1811,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                     chunk_src.data(), chunk_len, n_head, n_head_mem, chunk_colsum.data());
                                 kv->h2o_init_chunk_scores(layer.il, chunk_start, chunk_len, chunk_colsum.data());
 
-                                if (chunk_idx == 0 && !kv->h2o_is_memory_initialized()) {
+                                if (should_build_m0) {
                                     kv->h2o_build_memory_set(layer.il, chunk_end);
                                 }
+                            }
+
+                            // Set initialized flag AFTER all layers have built their memory set
+                            if (should_build_m0) {
+                                kv->h2o_set_memory_initialized(true);
                             }
                         }
                     }
@@ -1808,6 +1844,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     const uint32_t chunk_end = chunk_start + chunk_len;
 
                     const bool has_prev_chunks = base_tokens > 0 || h2o_chunk_idx > 0;
+                    if (getenv("H2O_DEBUG_PHASES")) {
+                        fprintf(stderr,
+                                "[H2O] phase2 chunk=%u chunk_start=%u chunk_len=%u chunk_end=%u has_prev=%d mem_init=%d\n",
+                                h2o_chunk_idx, chunk_start, chunk_len, chunk_end,
+                                has_prev_chunks ? 1 : 0, kv->h2o_is_memory_initialized() ? 1 : 0);
+                    }
                     if (has_prev_chunks) {
                         for (auto & [il, layer] : inter_layers) {
                             const uint32_t n_cols = static_cast<uint32_t>(layer.tensor->ne[0]);

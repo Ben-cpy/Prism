@@ -174,6 +174,7 @@ public:
     uint32_t h2o_get_chunk_idx() const { return h2o_state.current_chunk_idx; }
     uint32_t h2o_get_total_tokens() const { return h2o_state.total_tokens_processed; }
     bool h2o_is_memory_initialized() const { return h2o_memory_initialized; }
+    void h2o_set_memory_initialized(bool initialized) { h2o_memory_initialized = initialized; }
     uint32_t h2o_get_local_window() const { return h2o_local_window; }
     uint32_t h2o_get_heavy_budget() const { return h2o_heavy_budget; }
     uint32_t h2o_get_memory_size() const { return h2o_memory_size; }

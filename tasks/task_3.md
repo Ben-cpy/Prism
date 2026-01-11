@@ -128,10 +128,16 @@ After `graph_compute(...)` for **Phase 1** (all chunks processed in parallel via
 - For each chunk in the batch:
   - `chunk_start = kv.h2o_get_total_tokens() + chunk_idx * chunk_size`
   - `chunk_len = min(chunk_size, remaining)`
-  - call `kv.h2o_init_chunk_scores(il, chunk_start, chunk_len, colsum_slice)`
-  - if `chunk_idx == 0` and memory not initialized, call `kv.h2o_build_memory_set(il, chunk_end)` to build **M₀**
+  - For **each layer**: call `kv.h2o_init_chunk_scores(il, chunk_start, chunk_len, colsum_slice)`
+  - if `chunk_idx == 0` and memory not initialized:
+    - For **each layer**: call `kv.h2o_build_memory_set(il, chunk_end)` to build **M₀**
+    - **After all layers are done**: call `kv.h2o_set_memory_initialized(true)`
   - **DO NOT** call `kv.h2o_next_chunk(chunk_len)` here - chunk state advancement happens in Phase 2
 - Phase 1 also caches **intra online‑softmax state** (`intra_o/l/m`) for Phase‑2 fusion.
+
+**Critical: Per-Layer Initialization**
+The memory set M₀ must be built for **every layer** before setting `h2o_memory_initialized = true`.
+Since transformers are multi-layer architectures, each layer has its own `h2o_memory_indices` tensor that must be initialized independently. The initialized flag is a **global flag** that gates inter-attention for all layers, so it must only be set after all layers have completed their memory set construction.
 
 **Important (Two-Phase Design)**:
 - **Phase 1**: All chunks compute intra-attention in parallel (block-diagonal mask). Initialize scores for **all chunks**, cache intra online‑softmax state, and build **M₀** from chunk 0 scores.
