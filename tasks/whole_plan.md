@@ -15,6 +15,10 @@
 **Important**: "batch" in H2O context always means **logical batch** (`n_batch`), 
 not concurrent request count. We assume single-request inference (batch=1 in the 
 traditional sense).
+Note: if the prompt length exceeds `n_batch`, the caller must split it into
+multiple `llama_decode()` calls. H2O memory set (scores + indices) persists
+across calls for the same prompt, while the intra cache (`h2o_cache`) resets
+per call.
 
 ## Implementation Plan v1.0
 
@@ -190,12 +194,14 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 │  ┌─────────────────────────────────────────────────────────────┐   │
 │  │ PREFILL → DECODE TRANSITION                                  │   │
 │  │                                                              │   │
-│  │ After final chunk Cₖ₋₁ (which may be partial):              │   │
+│  │ After final chunk of the last prefill call (may be partial):   │   │
 │  │   1. Inter-attention: Q(Cₖ₋₁) × K(Mₖ₋₂)ᵀ                    │   │
 │  │   2. Online softmax fusion with intra-attention              │   │
 │  │   3. Store final chunk KV at positions [chunk_start, N)      │   │
 │  │   4. Memory set updates are no longer consumed in decode      │   │
 │  │                                                              │   │
+│  │ (If more prompt tokens remain for the next call, keep building│   │
+│  │  M and continue prefill instead of entering decode.)          │   │
 │  │ KV cache state at decode start:                              │   │
 │  │   • All N prompt positions have KV stored                    │   │
 │  │   • H2O scoring/selection is frozen (not used in decode)     │   │
@@ -213,9 +219,10 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 │  │   4. Store K(tᵢ), V(tᵢ) at position N + i in KV cache        │   │
 │  │   5. No H2O score updates, no memory set changes             │   │
 │  │                                                              │   │
-│  │ Implementation: build_attn_h2o path may be used, but the mask │   │
-│  │ collapses to standard causal attention when n_tokens <= S,   │   │
-│  │ and score updates are skipped (ubatch.n_tokens == 1)          │   │
+│  │ Implementation (preferred): keep build_attn_h2o path; mask    │   │
+│  │ degenerates to standard causal attention for n_tokens == 1,   │   │
+│  │ and score updates are skipped (ubatch.n_tokens == 1).         │   │
+│  │ Optional: skip colsum generation in decode to save overhead.  │   │
 │  └─────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 │  Rationale:                                                         │
@@ -229,7 +236,7 @@ where $A_{\text{inter}}$ is the attention weight matrix from inter-attention.
 
 **Final Chunk Handling**:
 
-The final chunk of prefill may not be a full `chunk_size` tokens:
+The final chunk of the **last prefill call** may not be a full `chunk_size` tokens:
 
 ```
 Example: N = 3500, chunk_size = 1024
@@ -245,8 +252,9 @@ Chunk 3: positions [3072, 3499]  - 428 tokens (partial, final)
 2. Compute inter-attention against memory set M₂
 3. Fuse via online softmax
 4. Store KV for positions [3072, 3499]
-5. **Skip** building M₃ - there's no next prefill chunk to use it
-6. **Skip** advancing chunk state - prefill is complete
+5. **If this is the final prefill call**, skip building M₃ (no next prefill chunk).  
+   Otherwise, build M₃ for the next call.
+6. **If prefill ends here**, skip advancing chunk state; otherwise advance as usual.
 
 **KV Cache State at Decode Start**:
 
@@ -283,11 +291,11 @@ Chunk 3: positions [3072, 3499]  - 428 tokens (partial, final)
 
 **Implementation Simplicity**:
 
-By using the standard decode path:
-- No changes to existing decode logic
+By keeping standard decode semantics (no H2O updates; build_attn_h2o path is OK):
+- No new decode-only branches are required
 - No additional H2O state management during decode
-- No risk of H2O bugs affecting generation
-- Easy to verify correctness (decode unchanged from baseline)
+- No risk of H2O score/memory bugs affecting generation
+- Easy to verify correctness (decode matches baseline behavior)
 
 ```
 
@@ -469,10 +477,13 @@ def populate_kv_cache(cache, k, v, chunk_idx, chunk_size):
 - **Current chunk tokens** receive initial scores from intra-attention
 
 #### Implementation Notes (current code)
-- H2O **prefill** activates only when the prompt spans **multiple chunks** (`n_tokens_all > n_ubatch`). Single‑chunk sequences use standard full attention.
+- H2O **prefill** activates only when: `causal_attn` is true, single-stream text
+  (not `pos_2d`), `n_ubatch > 0`, and the current call spans **multiple chunks**
+  (`n_tokens_all > h2o_chunk_size`). Single‑chunk calls use standard full attention.
 - **Phase 1** uses `n_batch` (logical batch) with a **block‑diagonal causal mask** to process all chunks in parallel and caches intra online‑softmax state (`o/l/m`).
 - After Phase‑1 colsum readback, scores are initialized for **all chunks** and **M₀** is built from chunk 0.
 - **Phase 2** runs per‑chunk (`n_ubatch`). Inter‑attention is used only when `ubatch.pos[0] > 0` and memory is initialized; then scores accumulate, **M_c** is rebuilt, and `h2o_next_chunk()` advances the chunk state.
+- For GQA, reduce colsum from Q‑heads to KV‑heads (`n_head_mem`) before score init/accumulation (MHA is a no‑op).
 
 #### Subtasks
 
@@ -1231,6 +1242,7 @@ $$C_{\text{ours}} = O(N(S + M)) = O(N(S + L + H))$$
 
 # Addition note
 + 说明：llama.cpp 提供 -b（n_batch）和 -ub（n_ubatch）。为与示例对齐，运行时使用 -b=4096、-ub=1024。
++ 当 prompt 长度 > n_batch 时，需要拆成多个 llama_decode 调用；H2O memory set 跨调用继承，h2o_cache 每次调用重置。
 + 原生 llama.cpp prefill 会把 -b 拆成多个 -ub **顺序**执行。
 + H2O 两阶段中：Phase 1 使用 block‑diagonal mask 一次性处理 n_batch（并行 intra），Phase 2 再按 n_ubatch 顺序处理。
     * **-b 逻辑批大小**默认 2048；示例中设为 4096

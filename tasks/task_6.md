@@ -8,21 +8,29 @@ Design decisions (confirmed):
 - Phase 1 prefill uses n_batch to run all physical chunks in parallel (ubatches inside the logical batch).
 - Single-batch text-only support (no multimodal or multi-sequence paths).
 - Memory selection remains per-chunk during phase 1 (plan A).
-- H2O cache lifetime is one prefill only; reset at the start of each prefill.
+- H2O intra cache (`h2o_cache`) is per prefill call (`llama_decode`); reset at the start of each prefill call.  
+  KV H2O state (scores + memory set) persists across multiple calls of the **same prompt**.
 
 ---
 
 ## Implementation Steps
 
-### Step 1: Confirm H2O activation and chunk sizing in decode
+### Step 1: Confirm H2O activation and chunk sizing in prefill
 
 **Files**
 - `src/llama-context.cpp`
 
 **What to do**
-1. Keep H2O enabled when `h2o_local_window + h2o_heavy_budget > 0`.
-2. Set `h2o_chunk_size` from `n_ubatch` (physical chunk size) and ensure it matches the KV cache chunk calculations.
-3. Ensure `h2o_cache.initialized = false` at the start of each H2O prefill (single-prefill lifetime).
+1. Feature gate: H2O is **available** when `h2o_local_window + h2o_heavy_budget > 0`.  
+   H2O **prefill path** is used only when:
+   - `cparams.causal_attn == true`
+   - single-stream text (`n_stream == 1`, not `pos_2d`)
+   - `n_ubatch > 0`
+   - `n_tokens_all > h2o_chunk_size` (i.e., > 1 chunk in this call)
+2. Set `h2o_chunk_size = (n_ubatch > 0 ? n_ubatch : n_batch)` and keep it consistent with KV cache chunk calculations.  
+   **Note**: block-diagonal masking relies on `n_ubatch > 0`; if `n_ubatch == 0`, treat H2O prefill as disabled.
+3. Ensure `h2o_cache.initialized = false` at the start of **each prefill call** (per `llama_decode`).  
+   Do **not** reset KV H2O state when continuing the same prompt across multiple calls.
 4. **Phase-1 parallelization (critical clarification)**:
    - Phase 1 processes the entire `n_batch` (e.g., 4096 tokens) in **one forward pass**
    - However, the attention computation uses a **block-diagonal causal mask**, NOT full attention
@@ -72,9 +80,9 @@ Query positions →
    - Computes intra attention.
    - Emits `t_h2o_intra_o`, `t_h2o_intra_l`, `t_h2o_intra_m`.
    - Emits `t_h2o_colsum` for score initialization.
-2. Copy these tensors into `h2o_cache` once per prefill:
+2. Copy these tensors into `h2o_cache` **once per prefill call**:
    - Validate `n_head`, `n_embd_head_v`, `n_tokens`, `n_stream`.
-   - Record `h2o_cache.base_pos = ubatch.pos[0]`.
+   - Record `h2o_cache.base_pos = ubatch.pos[0]` (absolute position of this call’s first token).
 3. Set `h2o_cache.initialized = true` only after all layers are captured.
 
 ---
@@ -87,7 +95,9 @@ Query positions →
 - `src/llama-kv-cache.cpp`
 
 **What to do**
-1. Use `t_h2o_colsum` from phase 1 to initialize scores:
+1. Use `t_h2o_colsum` from phase 1 to initialize scores.  
+   For GQA, **reduce Q-head colsum → KV-head colsum** (`n_head_mem`) before calling `h2o_init_chunk_scores`.  
+   (For MHA this is a no-op.)
    - `kv->h2o_init_chunk_scores(il, chunk_start, chunk_len, colsum)`
 2. Build memory set for chunk 0 immediately after scores:
    - `kv->h2o_build_memory_set(il, chunk_end)`
@@ -107,7 +117,8 @@ Query positions →
    - Uses `h2o_gather_k_memory()` / `h2o_gather_v_memory()` for inter attention.
    - Builds online softmax state from inter logits.
    - Fuses with cached intra output from `h2o_cache`.
-2. Ensure `t_h2o_inter_colsum` is produced for score accumulation.
+2. Ensure `t_h2o_inter_colsum` is produced for score accumulation.  
+   For GQA, **reduce to KV-heads** before `h2o_accumulate_memory_scores`.
 
 ---
 
@@ -133,8 +144,9 @@ Query positions →
 - `src/llama-graph.cpp`
 
 **What to do**
-1. Single chunk (`n_tokens <= chunk_size`): in here the chunk_size equals to ubatch size
-   - Bypass H2O inter path and run standard attention.
+1. Single chunk (`n_tokens_all <= h2o_chunk_size` for this call):  
+   - Standard attention semantics (full causal within the call).  
+   - Implementation may still route through `build_attn_h2o`; mask degenerates to standard and H2O updates are skipped.
 2. Partial final chunk:
    - Use `chunk_len = min(h2o_chunk_size, remaining_tokens)`.
    - Ensure no out-of-bounds access when slicing KV or colsum buffers.
@@ -147,47 +159,52 @@ Query positions →
 
 **What to do**
 
-When `n_tokens_all > n_batch` (prompt longer than single logical batch):
+When the **prompt length > n_batch**, the caller must split the prompt into **multiple `llama_decode` calls** (logical batches).  
+Cross-batch H2O **memory set** must persist across these calls.
 
-1. **First batch (batch_idx = 0)**:
+1. **First call (batch_idx = 0)**:
    - Process as normal: Phase 1 → Phase 2 → build M_{k-1}
-   - **DO NOT reset** H2O state after completion
+   - **DO NOT reset** KV H2O state after completion
 
-2. **Subsequent batches (batch_idx > 0)**:
-   - **Inherit** memory set M_{prev} from previous batch
-   - First chunk of new batch uses inter-attention with M_{prev}
+2. **Subsequent calls (batch_idx > 0)**:
+   - **Inherit** memory set M_{prev} from previous call
+   - First chunk of new call uses inter-attention with M_{prev}
    - Continue Phase 2 sequential processing
 
 **Example**: 16384 tokens, n_batch=4096, n_ubatch=1024
 
 ```
-Batch 0: tokens [0, 4095]
+Call 0: tokens [0, 4095]
   Phase 1: all 4 chunks compute intra in parallel
   Phase 2: sequential inter → produces M₃
 
-Batch 1: tokens [4096, 8191]
+Call 1: tokens [4096, 8191]
   Phase 1: all 4 chunks compute intra in parallel
-  Phase 2: Chunk 4 uses M₃ (from Batch 0!) → produces M₄, M₅, M₆, M₇
+  Phase 2: Chunk 4 uses M₃ (from Call 0!) → produces M₄, M₅, M₆, M₇
 
-Batch 2: tokens [8192, 12287]
+Call 2: tokens [8192, 12287]
   Phase 1: all 4 chunks compute intra in parallel
-  Phase 2: Chunk 8 uses M₇ (from Batch 1!) → produces M₈, M₉, M₁₀, M₁₁
+  Phase 2: Chunk 8 uses M₇ (from Call 1!) → produces M₈, M₉, M₁₀, M₁₁
 ```
 
 **Implementation**:
 ```cpp
-// In llama_decode_internal, at the START of each batch:
-const bool is_first_batch = (kv->h2o_get_total_tokens() == 0);
+// In llama_decode_internal, at the START of each call:
+const uint32_t base_tokens = kv->h2o_get_total_tokens();
+const bool is_first_batch = (base_tokens == 0);
 
 if (!is_first_batch) {
-    // Memory set from previous batch is still valid
+    // Memory set from previous call is still valid
     // h2o_memory_initialized == true
-    // First chunk of this batch will use it for inter-attention
+    // First chunk of this call will use it for inter-attention
 }
 ```
+**Important**:
+- Reset `h2o_cache` per call (phase-1 intra cache), but **do not reset KV H2O state** until a new request starts.
+- Only the **final chunk of the final prefill call** should skip building M; intermediate calls must still build M for the next call.
 ---
 
-### Step 7: Decode phase handling (Full KV cache, H2O disabled)
+### Step 7: Decode phase handling (Full KV cache, H2O updates disabled)
 
 **Files**
 - `src/llama-context.cpp`
@@ -205,7 +222,8 @@ After prefill completes, the KV cache contains:
 
 #### 7.2 Final Chunk Special Handling
 
-The final chunk requires special attention:
+The final chunk requires special attention.  
+**Note**: This refers to the **last chunk of the last prefill call**. If more prompt tokens remain (next `llama_decode` call), you must still build M for cross-batch continuation.
 
 ```
 Example: N = 4096 + 500 tokens, chunk_size = 1024
@@ -254,13 +272,11 @@ const bool is_decode = (ubatch.n_tokens == 1);
 const bool h2o_enabled = cparams.h2o_local_window + cparams.h2o_heavy_budget > 0;
 
 if (h2o_enabled && is_decode) {
-    // === STANDARD DECODE PATH (H2O bypassed) ===
-    
-    // 1. Use standard attention (build_attn), NOT build_attn_h2o
-    // 2. Attend to FULL KV cache: all positions [0, current_pos)
-    // 3. Store new K, V at position current_pos (standard KV cache write)
-    // 4. NO H2O scoring updates
-    // 5. NO memory set modifications
+    // === STANDARD DECODE SEMANTICS ===
+    // Preferred implementation: keep build_attn_h2o() path.
+    // - For n_tokens == 1, the mask degenerates to standard causal attention.
+    // - H2O scoring/memory updates are skipped (ubatch.n_tokens == 1 gate).
+    // Optional micro-optimization: skip colsum generation in decode.
 }
 ```
 
@@ -296,25 +312,10 @@ Decode token t₂:
 #### 7.5 Implementation Checklist
 
 1. **Detect decode mode**: `ubatch.n_tokens == 1`
-2. **Bypass H2O attention**: Use `build_attn()` instead of `build_attn_h2o()`
-3. **Full KV access**: No memory set gathering, attend to entire cache
-4. **Standard KV write**: Store K, V at `kv_head + n_past` as normal
-5. **Skip H2O state updates**: No `h2o_init_chunk_scores`, `h2o_accumulate_memory_scores`, `h2o_build_memory_set`, or `h2o_next_chunk`
-
-**Code change** (in `llama_decode_internal`):
-
-```cpp
-// At the start of decode processing:
-const bool is_decode_phase = (n_tokens_all == 1);
-
-if (h2o_enabled && !is_decode_phase) {
-    // H2O prefill path: two-phase processing
-    // ... (existing H2O logic)
-} else {
-    // Standard path: either decode (single token) or non-H2O prefill
-    // ... (existing standard llama_decode logic)
-}
-```
+2. **Full KV access**: Attention covers the entire cache `[0, current_pos)`
+3. **Standard KV write**: Store K, V at `kv_head + n_past` as normal
+4. **Skip H2O state updates**: No `h2o_init_chunk_scores`, `h2o_accumulate_memory_scores`, `h2o_build_memory_set`, or `h2o_next_chunk`
+5. **Implementation choice**: keep `build_attn_h2o()` (simplest, already aligned), or explicitly bypass it if you want to shave decode overhead.
 
 ---
 
@@ -332,7 +333,7 @@ if (h2o_enabled && !is_decode_phase) {
 
 ---
 
-## Verification Metrics
+## Verification Metrics (Overall)
 
 | Metric | Target | How to Verify |
 |--------|--------|---------------|
