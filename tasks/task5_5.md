@@ -287,3 +287,68 @@ LLAMACPP_TEST_MODELFILE=/models/Qwen_Qwen3-1.7B-Q8_0.gguf \
 - ✅ Memory sets update correctly across chunks
 - ✅ No double KV writes
 - ✅ End‑to‑end prefill runs without crashes
+
+---
+
+## 附录：ggml_get_rows 扩展实现
+
+### 问题背景
+H2O 的 memory gathering 需要支持 per-head 索引：每个 KV-head 有独立的 memory set。
+原 `ggml_get_rows` 限制索引 tensor 的第 4 维必须为 1（广播索引），无法支持此需求。
+
+### 解决方案
+扩展 `ggml_get_rows` 支持 per-batch 索引。
+
+**修改点**：`ggml/src/ggml.c:3804`
+```c
+// 原限制：
+GGML_ASSERT(b->ne[3] == 1);
+
+// 放宽为：
+GGML_ASSERT(b->ne[3] == 1 || b->ne[3] == a->ne[3]);
+```
+
+**语义**：
+- `b->ne[3] == 1`：原有行为，索引广播到所有 batch（向后兼容）
+- `b->ne[3] == a->ne[3]`：新增行为，每个 batch 使用独立索引
+
+### 实现细节
+**CPU backend** (`ggml-cpu/ops.cpp:4768-4807`)：
+- 已有代码在 line 4799 访问 `i12*nb12`，天然支持多维索引
+- **无需修改内核实现**
+
+**CUDA backend** (`ggml-cuda/getrows.cu`)：
+- 已有代码在 line 17-20 迭代 `ne11*ne12`，天然支持
+- **无需修改内核实现**
+
+### H2O 代码优化
+**优化前**：4 个 ggml 操作
+1. view (4D reshape)
+2. permute (swap dims 1,2)
+3. get_rows (失败：不支持 per-batch 索引)
+4. permute (swap back dims 1,2)
+
+**优化后**：3 个 ggml 操作（K cache）/ 4 个操作（V cache 带 transpose）
+1. view (4D reshape)
+2. permute (swap dims 1,2)
+3. view (mem_idx reshape to 4D)
+4. get_rows (支持 per-batch 索引，直接输出正确形状)
+5. permute (仅 V cache 需要，如果 v_trans=true)
+
+**性能提升**：
+- K cache: 消除 1 个 permute 操作（从 4 步减少到 3 步）
+- V cache: 保持相同操作数（4 步），但启用了 per-head gathering
+- 关键改进：启用 per-batch 索引，使每个 KV-head 可以有独立的 memory set
+- 更清晰的语义：直接表达 per-head gathering
+
+### 测试覆盖
+- `test-h2o-edge-cases`: 验证非均匀 chunk 场景
+- `test-h2o-gqa-memory`: 验证 GQA per-head 索引
+- `test-h2o-kv-cache`: 验证 KV cache 集成
+
+### 关键修改文件
+1. `ggml/src/ggml.c` - Line 3804: 放宽 `ggml_get_rows` 断言
+2. `ggml/include/ggml.h` - Line 1636-1647: 更新 API 文档
+3. `src/llama-kv-cache.cpp`:
+   - Line 1248-1276: 修改 `h2o_gather_k_memory`（添加 permute，使用扩展的 get_rows）
+   - Line 1297-1328: 修改 `h2o_gather_v_memory`（添加 permute，使用扩展的 get_rows）

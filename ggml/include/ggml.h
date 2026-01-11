@@ -1635,9 +1635,12 @@ extern "C" {
 
     // supports 4D a:
     // a     [n_embd, ne1, ne2, ne3]
-    // b I32 [n_rows, ne2, ne3, 1]
+    // b I32 [n_rows, ne2, ne3_b, 1]  // ne3_b == 1 (broadcast) or ne3_b == ne3 (per-batch)
     //
     // return [n_embd, n_rows, ne2, ne3]
+    //
+    // When ne3_b == 1: indices are broadcast across all batches (original behavior)
+    // When ne3_b == ne3: each batch uses its own index set (per-batch indexing)
     GGML_API struct ggml_tensor * ggml_get_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data

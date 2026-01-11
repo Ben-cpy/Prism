@@ -588,8 +588,9 @@ $$\text{Candidates} = (\mathcal{M}_{c-1} \cup C_c) \setminus \text{Local}_c$$
 This means tokens from earlier chunks (e.g., $C_0$) can survive into $\mathcal{M}_1, \mathcal{M}_2, \ldots$ if they continue receiving high attention scores.
 
 #### Implementation Notes (current code)
-- `h2o_build_memory_set()` is called **once in Phase 1** to build **M₀** after intra colsum is available.
-- In **Phase 2**, after each chunk’s inter‑attention, scores accumulate and **M_c** is rebuilt; `h2o_next_chunk()` advances the chunk boundary.
+- `h2o_build_memory_set()` is called **for each layer in Phase 1** to build **M₀** after intra colsum is available.
+- **Critical**: The memory set must be built for **every layer** before setting `h2o_memory_initialized = true`. Since transformers are multi-layer architectures, each layer has its own `h2o_memory_indices` tensor. The global `h2o_memory_initialized` flag gates inter-attention for all layers, so it must only be set after all layers complete their memory set construction.
+- In **Phase 2**, after each chunk's inter‑attention, scores accumulate and **M_c** is rebuilt; `h2o_next_chunk()` advances the chunk boundary.
 - Local window uses `chunk_end - L` clamped to 0; candidates are `(prev_memory ∪ current_chunk) \ local`.
 
 #### Subtasks

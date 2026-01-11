@@ -1245,15 +1245,32 @@ ggml_tensor * llama_kv_cache::h2o_gather_k_memory(ggml_context * ctx, int32_t il
     GGML_ASSERT(n_embd_k_gqa == n_embd_head_k * n_head_kv);
     GGML_ASSERT(n_stream == 1 || mem_idx->ne[2] == n_stream);
 
+    // Step 1: Create k_view with natural 4D reshape
+    // k_view: [n_embd_head_k, n_head_kv, kv_size, n_stream]
     ggml_tensor * k_view = ggml_view_4d(ctx, layer.k,
             n_embd_head_k, n_head_kv, kv_size, n_stream,
             ggml_row_size(layer.k->type, n_embd_head_k),
-            ggml_row_size(layer.k->type, n_embd_k_gqa),
+            ggml_row_size(layer.k->type, n_embd_head_k * n_head_kv),
             ggml_row_size(layer.k->type, n_embd_k_gqa * kv_size),
             0);
+
+    // Step 2: Permute to put kv_size in dimension 1 for gathering
+    // k_perm: [n_embd_head_k, kv_size, n_head_kv, n_stream]
     ggml_tensor * k_perm = ggml_permute(ctx, k_view, 0, 2, 1, 3);
-    ggml_tensor * k_rows = ggml_get_rows(ctx, k_perm, mem_idx);
-    ggml_tensor * k_mem = ggml_permute(ctx, k_rows, 0, 2, 1, 3);
+
+    // Step 3: Reshape mem_idx [M, n_head_kv] to 4D for per-batch indexing
+    // mem_idx_4d: [M, n_head_kv, n_stream, 1]
+    const uint32_t M = h2o_memory_size;
+    ggml_tensor * mem_idx_4d = ggml_view_4d(ctx, mem_idx,
+            M, n_head_kv, n_stream, 1,
+            mem_idx->nb[0], mem_idx->nb[1],
+            n_stream == 1 ? 0 : mem_idx->nb[1] * n_head_kv, 0);
+
+    // Step 4: Gather with per-batch indexing (extended ggml_get_rows)
+    // Input:  k_perm [n_embd_head_k, kv_size, n_head_kv, n_stream]
+    // Indices: mem_idx_4d [M, n_head_kv, n_stream, 1]
+    // Output: k_mem [n_embd_head_k, M, n_head_kv, n_stream] ✓ (correct shape directly)
+    ggml_tensor * k_mem = ggml_get_rows(ctx, k_perm, mem_idx_4d);
     ggml_set_name(k_mem, "h2o_k_mem");
 
     return k_mem;
@@ -1277,23 +1294,44 @@ ggml_tensor * llama_kv_cache::h2o_gather_v_memory(ggml_context * ctx, int32_t il
     GGML_ASSERT(n_embd_v_gqa >= n_embd_head_v * n_head_kv);
     GGML_ASSERT(n_stream == 1 || mem_idx->ne[2] == n_stream);
 
+    // Step 1: Create v_view with natural 4D reshape
+    // v_view: [n_embd_head_v, n_head_kv, kv_size, n_stream]
     ggml_tensor * v_view = ggml_view_4d(ctx, layer.v,
             n_embd_head_v, n_head_kv, kv_size, n_stream,
             ggml_row_size(layer.v->type, n_embd_head_v),
-            ggml_row_size(layer.v->type, n_embd_v_gqa),
+            ggml_row_size(layer.v->type, n_embd_head_v * n_head_kv),
             ggml_row_size(layer.v->type, n_embd_v_gqa * kv_size),
             0);
+
+    // Step 2: Permute to put kv_size in dimension 1 for gathering
+    // v_perm: [n_embd_head_v, kv_size, n_head_kv, n_stream]
     ggml_tensor * v_perm = ggml_permute(ctx, v_view, 0, 2, 1, 3);
-    ggml_tensor * v_rows = ggml_get_rows(ctx, v_perm, mem_idx);
+
+    // Step 3: Reshape mem_idx [M, n_head_kv] to 4D for per-batch indexing
+    // mem_idx_4d: [M, n_head_kv, n_stream, 1]
+    const uint32_t M = h2o_memory_size;
+    ggml_tensor * mem_idx_4d = ggml_view_4d(ctx, mem_idx,
+            M, n_head_kv, n_stream, 1,
+            mem_idx->nb[0], mem_idx->nb[1],
+            n_stream == 1 ? 0 : mem_idx->nb[1] * n_head_kv, 0);
+
+    // Step 4: Gather with per-batch indexing (extended ggml_get_rows)
+    // Input:  v_perm [n_embd_head_v, kv_size, n_head_kv, n_stream]
+    // Indices: mem_idx_4d [M, n_head_kv, n_stream, 1]
+    // Output: v_gathered [n_embd_head_v, M, n_head_kv, n_stream]
+    ggml_tensor * v_gathered = ggml_get_rows(ctx, v_perm, mem_idx_4d);
+
+    // Step 5: Handle V cache transpose if needed (only when v_trans == true)
+    // v_trans: [d, M, n_head, s] -> [M, d, n_head, s]
     ggml_tensor * v_mem = v_trans
-        ? ggml_permute(ctx, v_rows, 2, 0, 1, 3)
-        : ggml_permute(ctx, v_rows, 0, 2, 1, 3);
+        ? ggml_permute(ctx, v_gathered, 1, 0, 2, 3)
+        : v_gathered;
+
     if (debug >= 2) {
-        LLAMA_LOG_DEBUG("%s: v_view ne=[%lld,%lld,%lld,%lld] v_perm ne=[%lld,%lld,%lld,%lld] v_rows ne=[%lld,%lld,%lld,%lld] v_mem ne=[%lld,%lld,%lld,%lld] v_trans=%d\n",
+        LLAMA_LOG_DEBUG("%s: v_view ne=[%lld,%lld,%lld,%lld] v_gathered ne=[%lld,%lld,%lld,%lld] v_mem ne=[%lld,%lld,%lld,%lld] v_trans=%d\n",
                 __func__,
                 (long long) v_view->ne[0], (long long) v_view->ne[1], (long long) v_view->ne[2], (long long) v_view->ne[3],
-                (long long) v_perm->ne[0], (long long) v_perm->ne[1], (long long) v_perm->ne[2], (long long) v_perm->ne[3],
-                (long long) v_rows->ne[0], (long long) v_rows->ne[1], (long long) v_rows->ne[2], (long long) v_rows->ne[3],
+                (long long) v_gathered->ne[0], (long long) v_gathered->ne[1], (long long) v_gathered->ne[2], (long long) v_gathered->ne[3],
                 (long long) v_mem->ne[0], (long long) v_mem->ne[1], (long long) v_mem->ne[2], (long long) v_mem->ne[3],
                 v_trans ? 1 : 0);
     }

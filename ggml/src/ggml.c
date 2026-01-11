@@ -3801,7 +3801,8 @@ struct ggml_tensor * ggml_get_rows(
         struct ggml_tensor  * b) {
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == b->ne[2]);
-    GGML_ASSERT(b->ne[3] == 1);
+    // Allow per-batch indexing: b->ne[3] can be 1 (broadcast) or a->ne[3] (per-batch)
+    GGML_ASSERT(b->ne[3] == 1 || b->ne[3] == a->ne[3]);
     GGML_ASSERT(b->type == GGML_TYPE_I32);
 
     // TODO: implement non F32 return
