@@ -288,6 +288,7 @@ void test_cross_chunk_propagation(const llama_model & model, int32_t il) {
 
     kv->h2o_init_chunk_scores(il, 0, chunk_len, chunk0_scores.data());
     kv->h2o_build_memory_set(il, chunk_len);
+    kv->h2o_set_memory_initialized(true);
 
     const ggml_tensor * mem_idx = kv->h2o_get_memory_indices_tensor(il);
     require(kv->h2o_is_memory_initialized(), "memory not initialized after first chunk");
